@@ -33,6 +33,11 @@ from pathlib import Path
 
 import torch
 
+try:
+    from server import PromptServer as _PromptServer
+except Exception:
+    _PromptServer = None
+
 logger = logging.getLogger(__name__)
 
 # ── ensure bundled src/ and ltx2/ are importable ─────────────────────────────
@@ -76,10 +81,7 @@ class _HFModelWrapper(torch.nn.Module):
     HF models (e.g. Gemma3ForConditionalGeneration) define ``device`` as a
     read-only property.  ComfyUI's ModelPatcher sets ``model.device = ...``
     during load/offload which raises AttributeError on such models.
-    Wrapping the HF model as a registered sub-module solves this:
-    - ModelPatcher sets .device on *this* wrapper (which has no such property)
-    - .to(device) / parameter moves still cascade to the inner HF model
-      because it is registered via self.inner
+    Wrapping the HF model as a registered sub-module solves this.
     """
     def __init__(self, inner: torch.nn.Module) -> None:
         super().__init__()
@@ -90,11 +92,7 @@ class _HFModelWrapper(torch.nn.Module):
 
 
 def _make_patcher(module: torch.nn.Module, load_device: torch.device, wrap_hf: bool = False):
-    """Wrap *module* in a ComfyUI ModelPatcher so the memory manager tracks it.
-
-    Set ``wrap_hf=True`` for HuggingFace models that have a read-only
-    ``device`` property so ModelPatcher can do its device-assignment bookkeeping.
-    """
+    """Wrap *module* in a ComfyUI ModelPatcher so the memory manager tracks it."""
     import comfy.model_management as _mm
     import comfy.model_patcher
     target = _HFModelWrapper(module) if wrap_hf else module
@@ -107,30 +105,34 @@ def _make_patcher(module: torch.nn.Module, load_device: torch.device, wrap_hf: b
 
 
 def _load_models(device) -> dict:
-    """Load (or return cached) all DramaBox model components as ModelPatchers."""
+    """Load DramaBox model components with sequential CPU-offload initialisation.
+
+    Each sub-model is loaded to CPU (offload_device) where possible so only
+    one large model lives in VRAM at a time.  Gemma is an exception: bnb-4bit
+    weights require CUDA and cannot be moved to CPU after loading.
+    """
+    import comfy.model_management as mm
+
     cache_key = str(device)
     if cache_key in _LOADED_MODELS:
         logger.info("[DramaBox] Using cached models.")
         return _LOADED_MODELS[cache_key]
 
+    offload_device = mm.unet_offload_device()   # typically torch.device('cpu')
     torch_dtype = torch.bfloat16
 
-    # -- DramaBox weights (auto-download into node models/) -------------------
+    # -- Resolve weight paths (local-first via patched model_downloader) -------
     from model_downloader import get_model_path, get_gemma_path
-    logger.info("[DramaBox] Resolving DramaBox weights (downloads on first use)…")
+    logger.info("[DramaBox] Resolving model weights…")
     ckpt_transformer = get_model_path("transformer",      cache_dir=_MODELS_DIR)
     ckpt_audio       = get_model_path("audio_components", cache_dir=_MODELS_DIR)
-    logger.info("[DramaBox] transformer  : %s", ckpt_transformer)
-    logger.info("[DramaBox] audio comps  : %s", ckpt_audio)
-
-    # -- Gemma directory (auto-download unsloth/gemma-3-12b-it-bnb-4bit) ------
-    gemma_root = get_gemma_path(cache_dir=_MODELS_DIR)
-    logger.info("[DramaBox] gemma        : %s", gemma_root)
+    gemma_root       = get_gemma_path(cache_dir=_MODELS_DIR)
 
     from ltx_pipelines.utils.blocks import PromptEncoder, AudioConditioner, AudioDecoder
 
-    # -- 1. Prompt encoder ----------------------------------------------------
-    logger.info("[DramaBox] Loading PromptEncoder…")
+    # ── 1. PromptEncoder (Gemma bnb-4bit) — must live on GPU ─────────────────
+    # bitsandbytes 4-bit weights use CUDA kernels and cannot be .to('cpu').
+    logger.info("[DramaBox] Loading PromptEncoder (Gemma, GPU — bnb-4bit)…")
     prompt_encoder = PromptEncoder(
         checkpoint_path=ckpt_audio,
         gemma_root=gemma_root,
@@ -140,18 +142,29 @@ def _load_models(device) -> dict:
         use_bnb_4bit=True,
         audio_only=True,
     )
+    mm.soft_empty_cache()
 
-    # -- 2. Audio VAE encoder (for voice reference conditioning) --------------
-    logger.info("[DramaBox] Loading AudioConditioner…")
-    audio_conditioner = AudioConditioner(
-        checkpoint_path=ckpt_audio,
-        dtype=torch_dtype,
-        device=device,
-        warm=True,
-    )
+    # ── 2. AudioConditioner (VAE encoder) — load to CPU ──────────────────────
+    logger.info("[DramaBox] Loading AudioConditioner (CPU)…")
+    try:
+        audio_conditioner = AudioConditioner(
+            checkpoint_path=ckpt_audio,
+            dtype=torch_dtype,
+            device=offload_device,
+            warm=True,
+        )
+    except Exception as exc:
+        logger.warning("[DramaBox] CPU init failed for AudioConditioner (%s) — falling back to GPU", exc)
+        audio_conditioner = AudioConditioner(
+            checkpoint_path=ckpt_audio,
+            dtype=torch_dtype,
+            device=device,
+            warm=True,
+        )
+    mm.soft_empty_cache()
 
-    # -- 3. Transformer (LTX audio-only DiT) ----------------------------------
-    logger.info("[DramaBox] Loading Transformer…")
+    # ── 3. Transformer (LTX audio-only DiT) — build on CPU ───────────────────
+    logger.info("[DramaBox] Loading Transformer (CPU)…")
     from safetensors import safe_open
     from ltx_core.loader.registry import DummyRegistry
     from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
@@ -199,55 +212,82 @@ def _load_models(device) -> dict:
         .with_matching(prefix="model.diffusion_model.")
         .with_replacement("model.diffusion_model.", "")
     )
-    transformer = (
-        Builder(
-            model_path=ckpt_transformer,
-            model_class_configurator=_AudioOnlyConfigurator,
-            model_sd_ops=sd_ops,
-            registry=DummyRegistry(),
+    try:
+        transformer = (
+            Builder(
+                model_path=ckpt_transformer,
+                model_class_configurator=_AudioOnlyConfigurator,
+                model_sd_ops=sd_ops,
+                registry=DummyRegistry(),
+            )
+            .build(device=offload_device, dtype=torch_dtype)
+            .to(offload_device)
+            .eval()
         )
-        .build(device=device, dtype=torch_dtype)
-        .to(device)
-        .eval()
-    )
+    except Exception as exc:
+        logger.warning("[DramaBox] CPU build failed for Transformer (%s) — falling back to GPU", exc)
+        transformer = (
+            Builder(
+                model_path=ckpt_transformer,
+                model_class_configurator=_AudioOnlyConfigurator,
+                model_sd_ops=sd_ops,
+                registry=DummyRegistry(),
+            )
+            .build(device=device, dtype=torch_dtype)
+            .to(device)
+            .eval()
+        )
     n_params = sum(p.numel() for p in transformer.parameters()) / 1e9
     logger.info("[DramaBox] Transformer: %.1fB params", n_params)
+    mm.soft_empty_cache()
 
-    # -- 4. Audio VAE decoder + vocoder ----------------------------------------
-    logger.info("[DramaBox] Loading AudioDecoder…")
-    audio_decoder = AudioDecoder(
-        checkpoint_path=ckpt_audio,
-        dtype=torch_dtype,
-        device=device,
-        warm=True,
-    )
+    # ── 4. AudioDecoder (VAE decoder + vocoder) — load to CPU ────────────────
+    logger.info("[DramaBox] Loading AudioDecoder (CPU)…")
+    try:
+        audio_decoder = AudioDecoder(
+            checkpoint_path=ckpt_audio,
+            dtype=torch_dtype,
+            device=offload_device,
+            warm=True,
+        )
+    except Exception as exc:
+        logger.warning("[DramaBox] CPU init failed for AudioDecoder (%s) — falling back to GPU", exc)
+        audio_decoder = AudioDecoder(
+            checkpoint_path=ckpt_audio,
+            dtype=torch_dtype,
+            device=device,
+            warm=True,
+        )
+    mm.soft_empty_cache()
 
-    # ── Register all nn.Modules with ComfyUI model management ────────────────
-    # ComfyUI can now offload our models to CPU when other nodes need VRAM
-    # and reload them via load_models_gpu() at the start of each generate().
-    patchers = []
-
-    # Gemma text encoder (HF model inside GemmaTextEncoder wrapper)
-    # Uses wrap_hf=True because Gemma3ForConditionalGeneration.device is read-only.
+    # ── Build stage-specific patcher groups ───────────────────────────────────
+    # text_patchers  : Gemma text encoder + embeddings processor (step 5)
+    # voice_patchers : audio VAE encoder (step 3, optional)
+    # xfmr_patchers  : diffusion transformer (step 7)
+    # dec_patchers   : audio VAE decoder + vocoder (step 9)
+    text_patchers = []
     _gemma_nn = getattr(prompt_encoder._warm_text_encoder, "model", None)
     if _gemma_nn is not None:
-        patchers.append(_make_patcher(_gemma_nn, device, wrap_hf=True))
+        text_patchers.append(_make_patcher(_gemma_nn, device, wrap_hf=True))
+    text_patchers.append(_make_patcher(prompt_encoder._warm_embeddings_processor, device))
 
-    # Embeddings processor
-    patchers.append(_make_patcher(prompt_encoder._warm_embeddings_processor, device))
+    voice_patchers = [_make_patcher(audio_conditioner._warm_encoder, device)]
 
-    # Audio VAE encoder
-    patchers.append(_make_patcher(audio_conditioner._warm_encoder, device))
+    xfmr_patchers = [_make_patcher(transformer, device)]
 
-    # Transformer
-    patchers.append(_make_patcher(transformer, device))
+    dec_patchers = [
+        _make_patcher(audio_decoder._warm_decoder, device),
+        _make_patcher(audio_decoder._warm_vocoder, device),
+    ]
 
-    # Audio VAE decoder + vocoder
-    patchers.append(_make_patcher(audio_decoder._warm_decoder, device))
-    patchers.append(_make_patcher(audio_decoder._warm_vocoder, device))
+    all_patchers = text_patchers + voice_patchers + xfmr_patchers + dec_patchers
 
     model = {
-        "patchers":          patchers,
+        "patchers":          all_patchers,
+        "text_patchers":     text_patchers,
+        "voice_patchers":    voice_patchers,
+        "xfmr_patchers":     xfmr_patchers,
+        "dec_patchers":      dec_patchers,
         "prompt_encoder":    prompt_encoder,
         "audio_conditioner": audio_conditioner,
         "transformer":       transformer,
@@ -256,7 +296,7 @@ def _load_models(device) -> dict:
         "dtype":             torch_dtype,
     }
     _LOADED_MODELS[cache_key] = model
-    logger.info("[DramaBox] All components loaded and registered with ComfyUI model management.")
+    logger.info("[DramaBox] All components loaded (Gemma on GPU, others on CPU).")
     return model
 
 
@@ -307,7 +347,16 @@ class DramaBoxTTS:
                     "INT",
                     {"default": 0, "min": 0, "max": 2**31 - 1, "control_after_generate": True},
                 ),
-                "prompt": (
+                "use_prompt_input": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "label_on": "on",
+                        "label_off": "off",
+                        "tooltip": "When on, use the connected prompt input instead of the text widget.",
+                    },
+                ),
+                "text": (
                     "STRING",
                     {
                         "multiline": True,
@@ -325,16 +374,32 @@ class DramaBoxTTS:
                     "AUDIO",
                     {"tooltip": "Reference voice for cloning. 5–15 s of clean speech works best."},
                 ),
+                "prompt": (
+                    "STRING",
+                    {
+                        "multiline": True,
+                        "forceInput": True,
+                        "lazy": True,
+                        "tooltip": "Connect any text source here to override the text widget.",
+                    },
+                ),
                 "options": (
                     "DRAMABOX_OPTIONS",
                     {"tooltip": "Connect DramaBox Options for cfg, steps, duration, and more."},
                 ),
             },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            },
         }
 
     @classmethod
-    def IS_CHANGED(cls, seed, **kwargs):
-        return seed
+    def IS_CHANGED(cls, seed, use_prompt_input=False, text="", prompt=None, **kwargs):
+        return (seed, use_prompt_input, prompt)
+
+    def check_lazy_status(self, seed, use_prompt_input=False, text="", **kwargs):
+        """Request the connected prompt only when use_prompt_input is enabled."""
+        return ["prompt"] if use_prompt_input else []
 
     # ------------------------------------------------------------------ #
 
@@ -342,19 +407,34 @@ class DramaBoxTTS:
     def generate(
         self,
         seed: int = 0,
-        prompt: str = "",
+        use_prompt_input: bool = False,
+        text: str = "",
+        prompt: str | None = None,
         voice_ref=None,
         options: dict | None = None,
+        unique_id=None,
     ):
         import comfy.model_management as mm
         device = mm.get_torch_device()
 
+        # Use connected text source when the toggle is on, else fall back to widget text
+        used_prompt = prompt if (use_prompt_input and prompt) else text
+
+        # Notify the frontend so it can display the active prompt in the widget
+        if unique_id is not None and _PromptServer is not None:
+            try:
+                _PromptServer.instance.send_sync(
+                    "dramabox-tts-update",
+                    {"node_id": unique_id, "prompt": used_prompt, "use_prompt_input": use_prompt_input},
+                )
+            except Exception:
+                pass
+
         # ── Load (or retrieve cached) model components ───────────────────
         # _load_models() builds ModelPatchers on first call; subsequent calls
-        # return the cache. load_models_gpu() then ensures all our modules are
-        # on the target device — ComfyUI will offload other models if needed.
+        # return the cache. load_models_gpu() is called per-stage so only one
+        # set of weights occupies VRAM at a time.
         model = _load_models(device)
-        mm.load_models_gpu(model["patchers"])
 
         opts = options or {}
         ref_duration: float  = opts.get("ref_duration", 10.0)
@@ -397,7 +477,7 @@ class DramaBoxTTS:
         if gen_duration and gen_duration > 0:
             gen_dur = float(gen_duration)
         else:
-            gen_dur = round(estimate_speech_duration(prompt) * duration_mult, 1)
+            gen_dur = round(estimate_speech_duration(used_prompt) * duration_mult, 1)
         fps = 25.0
         n_frames = int(round(gen_dur * fps)) + 1
         n_frames = ((n_frames - 1 + 4) // 8) * 8 + 1
@@ -410,6 +490,7 @@ class DramaBoxTTS:
         state = audio_tools.create_initial_state(device=device, dtype=torch_dtype)
 
         # ── 3. Voice reference conditioning ─────────────────────────────
+        mm.load_models_gpu(model["voice_patchers"])
         if voice_ref is not None:
             try:
                 from ltx_pipelines.utils.media_io import decode_audio_from_file
@@ -462,11 +543,13 @@ class DramaBoxTTS:
         state = GaussianNoiser(generator=gen)(state, noise_scale=1.0)
 
         # ── 5. Encode text prompts ───────────────────────────────────────
+        mm.load_models_gpu(model["text_patchers"])
         logger.info("[DramaBox] Encoding prompts…")
-        prompts = [prompt, negative_prompt] if cfg_scale > 1.0 else [prompt]
+        prompts = [used_prompt, negative_prompt] if cfg_scale > 1.0 else [used_prompt]
         ctx = prompt_enc(prompts, streaming_prefetch_count=None)
         a_ctx     = ctx[0].audio_encoding
         a_ctx_neg = ctx[1].audio_encoding if cfg_scale > 1.0 else None
+        mm.soft_empty_cache()
 
         # ── 6. Build denoiser ────────────────────────────────────────────
         guider = MultiModalGuider(
@@ -487,6 +570,7 @@ class DramaBoxTTS:
         )
 
         # ── 7. Diffusion sampling ────────────────────────────────────────
+        mm.load_models_gpu(model["xfmr_patchers"])
         logger.info(
             "[DramaBox] Denoising (%d steps, cfg=%.1f, stg=%.1f)…",
             steps, cfg_scale, stg_scale,
@@ -501,6 +585,8 @@ class DramaBoxTTS:
             transformer=x0,
             denoiser=denoiser,
         )
+
+        mm.soft_empty_cache()
 
         # ── 8. Unpatchify + end-of-clip silence-prior fix ─────────────────
         audio_state = audio_tools.clear_conditioning(audio_state)
@@ -519,8 +605,11 @@ class DramaBoxTTS:
             latent = patched
 
         # ── 9. Decode latents → waveform ────────────────────────────────
+        mm.load_models_gpu(model["dec_patchers"])
         logger.info("[DramaBox] Decoding…")
         decoded = decoder(latent)
+
+        mm.soft_empty_cache()
 
         # ── 10. Return as ComfyUI AUDIO ──────────────────────────────────
         waveform = decoded.waveform.cpu().float()

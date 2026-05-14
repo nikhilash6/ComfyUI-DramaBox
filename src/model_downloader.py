@@ -28,7 +28,7 @@ MODEL_FILES = {
 
 
 def get_model_path(name: str, cache_dir: str = None) -> str:
-    """Download a model file from HF and return local path.
+    """Return local path for a model file, downloading from HF only if needed.
 
     Args:
         name: One of 'transformer', 'audio_components', 'silence_latent'
@@ -43,8 +43,14 @@ def get_model_path(name: str, cache_dir: str = None) -> str:
         raise ValueError(f"Unknown model: {name}. Choose from: {list(MODEL_FILES.keys())}")
 
     repo_path = MODEL_FILES[name]
-    logger.info(f"Fetching {name} from {DRAMABOX_REPO}/{repo_path}...")
 
+    # Check if the file already lives directly in cache_dir (flat layout)
+    local_candidate = os.path.join(cache_dir, os.path.basename(repo_path))
+    if os.path.isfile(local_candidate):
+        logger.info(f"Found {name} locally: {local_candidate}")
+        return local_candidate
+
+    logger.info(f"Fetching {name} from {DRAMABOX_REPO}/{repo_path}...")
     local_path = hf_hub_download(
         repo_id=DRAMABOX_REPO,
         filename=repo_path,
@@ -56,13 +62,21 @@ def get_model_path(name: str, cache_dir: str = None) -> str:
 
 
 def get_gemma_path(cache_dir: str = None) -> str:
-    """Download Gemma 3 12B IT (pre-quantized bnb-4bit via unsloth) and return
-    the snapshot directory. Using the pre-quantized variant skips runtime
-    bitsandbytes quantization and ~halves the Gemma load time.
+    """Return local Gemma snapshot directory, downloading from HF only if needed.
+
+    Using the pre-quantized bnb-4bit variant skips runtime bitsandbytes
+    quantization and ~halves the Gemma load time.
     """
     cache_dir = cache_dir or DEFAULT_CACHE
-    logger.info(f"Fetching Gemma from {GEMMA_REPO}...")
 
+    # Check if a local snapshot directory already exists directly under cache_dir
+    gemma_name = GEMMA_REPO.split("/")[-1]   # e.g. "gemma-3-12b-it-bnb-4bit"
+    local_candidate = os.path.join(cache_dir, gemma_name)
+    if os.path.isdir(local_candidate):
+        logger.info(f"Found Gemma locally: {local_candidate}")
+        return local_candidate
+
+    logger.info(f"Fetching Gemma from {GEMMA_REPO}...")
     local_dir = snapshot_download(
         repo_id=GEMMA_REPO,
         cache_dir=cache_dir,
