@@ -1,0 +1,2 @@
+# Downloaded model weights — excluded from git so node updates don't touch them
+models/

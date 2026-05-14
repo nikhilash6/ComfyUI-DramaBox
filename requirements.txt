@@ -1,0 +1,4 @@
+# ComfyUI-DramaBox extra dependencies
+
+bitsandbytes>=0.45.0
+soundfile>=0.12.0

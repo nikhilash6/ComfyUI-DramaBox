@@ -1,0 +1,6 @@
+{
+    "dtype": "bf16",
+    "compile_model": false,
+    "bnb_4bit": true,
+    "cache_dir": null
+}
