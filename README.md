@@ -23,9 +23,9 @@ ComfyUI custom nodes for [DramaBox](https://github.com/resemble-ai/DramaBox) —
 
 3. On first run, the node will automatically download all model weights (~7 GB) into `custom_nodes/ComfyUI-DramaBox/models/`.
 
-## bitsandbytes on newer CUDA versions (12.9 / 13.x)
+## bitsandbytes on newer CUDA versions (13.x)
 
-The released `bitsandbytes` packages on PyPI only ship pre-compiled CUDA binaries up to a certain version. If your CUDA toolkit is newer (e.g. 13.0, 13.2) you will see an error like:
+The released `bitsandbytes` packages on PyPI only ship pre-compiled CUDA binaries up to a certain version. If your CUDA toolkit is newer (e.g. 13.2) you will see an error like:
 
 ```
 bitsandbytes library load error: Configured CUDA binary not found at …libbitsandbytes_cuda132.dll
