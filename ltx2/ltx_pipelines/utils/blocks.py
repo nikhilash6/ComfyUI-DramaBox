@@ -494,7 +494,36 @@ class PromptEncoder:
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_compute_dtype=self._dtype,
             )
-        hf_model = Gemma3ForConditionalGeneration.from_pretrained(gemma_root, **from_kwargs)
+        # Try attention implementations in priority order, falling back to sdpa
+        # which is always available via PyTorch's native F.scaled_dot_product_attention.
+        _attn_candidates = []
+        try:
+            import flash_attn as _fa
+            _fa_ver = tuple(int(x) for x in _fa.__version__.split(".")[:2])
+            if _fa_ver >= (2, 7):
+                _attn_candidates.append("flash_attention_3")
+            _attn_candidates.append("flash_attention_2")
+        except ImportError:
+            pass
+        _attn_candidates.append(None)   # None = transformers auto (xformers / default)
+        _attn_candidates.append("sdpa") # guaranteed fallback
+
+        hf_model = None
+        for _attn_impl in _attn_candidates:
+            try:
+                _kwargs = dict(from_kwargs)
+                if _attn_impl is not None:
+                    _kwargs["attn_implementation"] = _attn_impl
+                hf_model = Gemma3ForConditionalGeneration.from_pretrained(gemma_root, **_kwargs)
+                logging.info("Gemma loaded with attn_implementation=%r", _attn_impl or "auto")
+                break
+            except Exception as _attn_err:
+                logging.warning(
+                    "Gemma load with attn_implementation=%r failed (%s) — trying next",
+                    _attn_impl or "auto", _attn_err,
+                )
+        if hf_model is None:
+            raise RuntimeError("Gemma failed to load with all attention implementations.")
         tokenizer = LTXVGemmaTokenizer(
             str(find_matching_file(gemma_root, "tokenizer.model").parent), 1024
         )
