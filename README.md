@@ -13,6 +13,19 @@ ComfyUI custom nodes for [DramaBox](https://github.com/resemble-ai/DramaBox) —
   <img src="docs/images/example.png" alt="DramaBox">
 </div>
 
+## LoRA Support
+
+The **DramaBox TTS** node accepts a `lora_stack` input (connect any ComfyUI **LORA_STACK** output). LoRA weights are applied directly into the already-loaded model and removed immediately after generation, so you can switch LoRAs between runs without triggering a slow model reload.
+
+LoRAs and voice reference samples work independently and can be used together. A LoRA bakes a trained voice style into the model weights, while a voice reference sample is fed as audio conditioning during generation. Using both at once — for example a LoRA trained on a voice alongside a reference clip of that same voice — will reinforce the effect.
+
+> **Note:** DramaBox LoRAs are specific to this model and cannot be used with other ComfyUI nodes such as LTX Video.
+
+
+### Training your own voice LoRAs
+
+Voice LoRAs for DramaBox can be trained with **[Voice Clone Studio — DramaBox Edition](https://github.com/FranckyB/Voice-Clone-Studio-DramaBox)**, a dedicated training and inference UI for the DramaBox model. Record or import a few minutes of a target voice, run the trainer, and drop the resulting `.safetensors` file into ComfyUI's `models/loras/` folder.
+
 ## Installation
 
 1. Navigate to your ComfyUI custom nodes directory:
