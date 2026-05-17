@@ -125,14 +125,20 @@ def _find_or_download_gemma_path():
     # 1. User preference from ComfyUI settings
     preferred = (_get_dramabox_setting("DramaBox.defaultTextEncoder") or "").strip()
     if preferred:
+        # Allow omitting the .safetensors extension
+        if not os.path.splitext(preferred)[1]:
+            preferred = preferred + ".safetensors"
+        import glob as _glob
         for folder in te_dirs:
+            # Exact flat match first
             candidate = os.path.join(folder, preferred)
             if os.path.isfile(candidate):
                 return candidate
-        raise FileNotFoundError(
-            f"[DramaBox] Preferred text encoder '{preferred}' not found in any text_encoders folder. "
-            "Update the filename in ComfyUI Settings → DramaBox, or clear it to use the default."
-        )
+            # Recursive search in subfolders
+            matches = _glob.glob(os.path.join(folder, "**", preferred), recursive=True)
+            if matches:
+                return matches[0]
+        print(f"[DramaBox] Warning: preferred text encoder '{preferred}' not found — falling back to default.")
 
     # 2. Default fp4 mixed file
     for folder in te_dirs:
@@ -386,16 +392,22 @@ def _load_text_encoder(device):
 
     Uses DramaBoxTextEncoderLoader so the fallback path is identical to the
     connected-CLIP path — both go through DramaBoxTEModel + ModelPatcher.
-    Result is cached; pass ``device='cpu'`` to force CPU offload.
+    Result is cached by (device, path); a settings change triggers a reload.
     """
-    cache_key = str(device)
-    if cache_key in _LOADED_TEXT_ENCODER:
-        return _LOADED_TEXT_ENCODER[cache_key]
-
     from .dramabox_clip import DramaBoxTextEncoderLoader
 
     gemma_path = _find_or_download_gemma_path()
+    cache_key = f"{device}:{gemma_path}"
 
+    if cache_key in _LOADED_TEXT_ENCODER:
+        return _LOADED_TEXT_ENCODER[cache_key]
+
+    # Evict any stale entry for this device (different path)
+    stale = [k for k in list(_LOADED_TEXT_ENCODER) if k.startswith(f"{device}:")]
+    for k in stale:
+        del _LOADED_TEXT_ENCODER[k]
+
+    print(f"[DramaBox] Loading text encoder: {os.path.basename(gemma_path)}")
     clip_device = "cpu" if str(device) == "cpu" else "default"
     (clip,) = DramaBoxTextEncoderLoader().load(gemma_path, clip_device)
     _LOADED_TEXT_ENCODER[cache_key] = clip
@@ -901,53 +913,10 @@ class DramaBoxTTS:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-
-class DramaBoxFreeVRAM:
-    """Unload all DramaBox models from GPU and CPU RAM.
-
-    Add this node after your last DramaBox TTS node when switching to other
-    workflows that need the VRAM.  The next DramaBox generation will reload
-    from disk automatically.
-    """
-
-    CATEGORY = "DramaBox"
-    DESCRIPTION = (
-        "Unload all DramaBox models (Gemma + transformer + audio components) from "
-        "GPU and CPU RAM.  Connect after your last DramaBox TTS node when switching "
-        "to other workflows.  Models reload automatically on next use."
-    )
-    RETURN_TYPES = ("STRING", "AUDIO")
-    RETURN_NAMES = ("status", "audio")
-    FUNCTION = "free_vram"
-    OUTPUT_NODE = True
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {},
-            "optional": {
-                "audio": ("AUDIO", {"tooltip": "Connect to chain this node after DramaBox TTS"}),
-            },
-        }
-
-    def free_vram(self, audio=None):
-        import comfy.model_management as mm
-        before = mm.get_free_memory()
-        _unload_dramabox_models()
-        after = mm.get_free_memory()
-        freed_mb = max(0, after - before) / (1024 * 1024)
-        status = f"DramaBox models unloaded. Freed ~{freed_mb:.0f} MB VRAM."
-        logger.info("[DramaBox] %s", status)
-        return (status, audio)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 NODE_CLASS_MAPPINGS = {
-    "DramaBoxTTS":       DramaBoxTTS,
-    "DramaBoxFreeVRAM":  DramaBoxFreeVRAM,
+    "DramaBoxTTS": DramaBoxTTS,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "DramaBoxTTS":      "DramaBox TTS",
-    "DramaBoxFreeVRAM": "DramaBox Free VRAM",
+    "DramaBoxTTS": "DramaBox TTS",
 }
