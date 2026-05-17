@@ -1,9 +1,17 @@
 """
 DramaBox TTS — ComfyUI node that runs the full LTX audio diffusion pipeline.
 
-DramaBox weights and Gemma text encoder auto-download from HuggingFace into
-    ComfyUI/custom_nodes/ComfyUI-DramaBox/models/   (~30 GB total, gitignored)
-on first use and are cached locally afterwards.
+DramaBox weights (~8.5 GB) download automatically from HuggingFace on first use into:
+
+    ComfyUI/models/dramabox/
+        dramabox-dit-v1.safetensors
+        dramabox-audio-components.safetensors
+        silence_latent_frame.pt
+    ComfyUI/models/dramabox/gemma-3-12b-it-bnb-4bit/
+        <full snapshot>
+
+Existing weights in the old node-local models/ folder are migrated automatically.
+Once present, files are loaded directly — no HuggingFace API calls on startup.
 
 Inputs
 ------
@@ -47,9 +55,14 @@ for _sub in ("src", "ltx2"):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-# Node-local models folder (gitignored) — DramaBox weights land here
-_MODELS_DIR = os.path.join(_NODE_DIR, "models")
-os.makedirs(_MODELS_DIR, exist_ok=True)
+# Use ComfyUI's central models folder so weights are shared with other nodes.
+# Fall back to the node-local models/ dir when running outside ComfyUI.
+try:
+    import folder_paths as _folder_paths
+    _MODELS_DIR = _folder_paths.models_dir
+except Exception:
+    _MODELS_DIR = os.path.join(_NODE_DIR, "models")
+os.makedirs(os.path.join(_MODELS_DIR, "dramabox"), exist_ok=True)
 
 _DEFAULT_NEG = (
     "worst quality, inconsistent motion, blurry, jittery, distorted, "
