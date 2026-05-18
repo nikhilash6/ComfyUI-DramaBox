@@ -27,6 +27,8 @@ import itertools
 import logging
 import os
 import sys
+import gc
+import types
 
 import torch
 
@@ -104,6 +106,100 @@ class DramaBoxTEModel(torch.nn.Module):
             # has no weights in this checkpoint (audio-only) so its random-init
             # weights must also be bf16 to avoid dtype errors during forward.
             self.embeddings_processor = self.embeddings_processor.to(torch.bfloat16)
+            self._enable_audio_only_embeddings()
+
+    def _enable_audio_only_embeddings(self):
+        """Drop video-only EP branches to match DramaBox audio-only usage."""
+        ep = self.embeddings_processor
+        if ep is None:
+            return
+
+        freed = 0
+
+        # 1) Remove video connector weights.
+        if getattr(ep, "video_connector", None) is not None:
+            try:
+                freed += sum(
+                    p.numel() * p.element_size()
+                    for p in ep.video_connector.parameters()
+                    if not p.is_meta
+                )
+            except Exception:
+                pass
+            del ep.video_connector
+            ep.video_connector = None
+
+        # 2) Replace video aggregate projection with a tiny no-op module.
+        fe = getattr(ep, "feature_extractor", None)
+        if fe is not None and getattr(fe, "video_aggregate_embed", None) is not None:
+            try:
+                freed += sum(
+                    p.numel() * p.element_size()
+                    for p in fe.video_aggregate_embed.parameters()
+                    if not p.is_meta
+                )
+            except Exception:
+                pass
+            out_features = fe.video_aggregate_embed.out_features
+            del fe.video_aggregate_embed
+
+            class _DummyVideoEmbed(torch.nn.Module):
+                def __init__(self, out_f):
+                    super().__init__()
+                    self.out_features = out_f
+
+                def forward(self, x):
+                    return torch.zeros(
+                        x.shape[0], x.shape[1], self.out_features,
+                        device=x.device, dtype=x.dtype,
+                    )
+
+            fe.video_aggregate_embed = _DummyVideoEmbed(out_features)
+
+        # 2b) Patch feature extractor to compute audio branch only.
+        # This avoids allocating full-size video features during prompt encoding.
+        if fe is not None and getattr(fe, "audio_aggregate_embed", None) is not None:
+            def _forward_audio_only(self, hidden_states, attention_mask, padding_side="left"):
+                from ltx_core.text_encoders.gemma.feature_extractor import (
+                    _rescale_norm,
+                    norm_and_concat_per_token_rms,
+                )
+                encoded = (
+                    torch.stack(hidden_states, dim=-1)
+                    if isinstance(hidden_states, (list, tuple))
+                    else hidden_states
+                )
+                normed = norm_and_concat_per_token_rms(encoded, attention_mask).to(encoded.dtype)
+                a_dim = self.audio_aggregate_embed.out_features
+                audio = self.audio_aggregate_embed(_rescale_norm(normed, a_dim, self.embedding_dim))
+                video = audio.new_zeros((audio.shape[0], audio.shape[1], 1))
+                return video, audio
+
+            fe.forward = types.MethodType(_forward_audio_only, fe)
+
+        # 3) Patch create_embeddings to skip video connector entirely.
+        def _audio_only_create(video_features, audio_features, additive_attention_mask, _ep=ep):
+            m = additive_attention_mask
+            while m.dim() > 2:
+                m = m[:, 0]
+            binary_mask = (m >= -1.0).to(torch.int64)
+
+            audio_encoded = None
+            if _ep.audio_connector is not None:
+                audio_encoded, _ = _ep.audio_connector(audio_features, additive_attention_mask)
+
+            # Keep API contract: return video tensor, audio tensor, and binary mask.
+            # DramaBox TTS consumes only audio_encoding.
+            return video_features, audio_encoded, binary_mask
+
+        ep.create_embeddings = _audio_only_create
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        if freed:
+            logger.info("[DramaBox] Text encoder audio-only mode enabled; dropped ~%.2f GB video branch", freed / 1e9)
 
     # ── ComfyUI CLIP options protocol ────────────────────────────────────────
 
@@ -123,11 +219,38 @@ class DramaBoxTEModel(torch.nn.Module):
         # [B, L, T, D]  —  L=49 layers, T=seq_len, D=3840
         out, _pooled, extra = self.gemma3_12b.encode_token_weights(token_weight_pairs_g)
 
-        # → [B, T, D, L]  (DramaBox FeatureExtractor accepts this directly)
-        out = out.movedim(1, -1)
-
         # Binary attention mask [B, T] (1 = valid token, 0 = padding)
         attention_mask = extra["attention_mask"]
+
+        # Trim padded-token tail for memory savings, but preserve connector constraints.
+        # Embeddings1DConnector with learnable registers requires seq_len to be a
+        # multiple of num_learnable_registers (typically 128).
+        valid_tokens = int(attention_mask.sum(dim=-1).max().item())
+        seq_len = out.shape[2]
+        keep_tokens = seq_len
+
+        num_regs = None
+        try:
+            num_regs = getattr(self.embeddings_processor.audio_connector, "num_learnable_registers", None)
+        except Exception:
+            num_regs = None
+
+        if num_regs and num_regs > 0:
+            rounded = ((max(1, valid_tokens) + num_regs - 1) // num_regs) * num_regs
+            keep_tokens = max(num_regs, min(seq_len, rounded))
+            # If clamped by seq_len, ensure divisibility is still preserved.
+            keep_tokens = (keep_tokens // num_regs) * num_regs
+            if keep_tokens <= 0:
+                keep_tokens = seq_len
+        elif valid_tokens > 0:
+            keep_tokens = min(seq_len, valid_tokens)
+
+        if seq_len > keep_tokens:
+            out = out[:, :, -keep_tokens:]
+            attention_mask = attention_mask[:, -keep_tokens:]
+
+        # → [B, T, D, L]  (DramaBox FeatureExtractor accepts this directly)
+        out = out.movedim(1, -1)
 
         # Gemma returns activations on intermediate_device (CPU by default).
         # EmbeddingsProcessor weights live on the execution device (GPU) and
@@ -143,12 +266,7 @@ class DramaBoxTEModel(torch.nn.Module):
         return (
             ep_out.audio_encoding,
             None,
-            {
-                "dramabox_audio_encoding": ep_out.audio_encoding,
-                "dramabox_video_encoding": ep_out.video_encoding,
-                "dramabox_attention_mask": ep_out.attention_mask,
-                "attention_mask": attention_mask,
-            },
+            {},
         )
 
     # ── Weight loading ───────────────────────────────────────────────────────
@@ -251,7 +369,8 @@ def _list_audio_component_files():
     for folder in dirs:
         for pat in (
             "*audio*component*.safetensors",
-            "*dramabox*.safetensors",
+            "*audio*components*.safetensors",
+            "*dramabox*audio*.safetensors",
         ):
             found.extend(glob.glob(os.path.join(folder, "**", pat), recursive=True))
     seen = set()
@@ -320,15 +439,21 @@ class DramaBoxTextEncoderLoader:
                 "ComfyUI/models/checkpoints/ or the DramaBox models/ folder."
             )
 
-        # Load both state dicts — exactly as load_clip / load_text_encoder_state_dicts does
-        gemma_sd, _ = comfy.utils.load_torch_file(gemma_path, return_metadata=True)
-        audio_sd, _ = comfy.utils.load_torch_file(audio_path, return_metadata=True)
-        clip_data = [gemma_sd, audio_sd]
-
         # model_options: only CPU override if requested (same as LTXAVTextEncoderLoader)
         model_options = {}
         if device == "cpu":
             model_options["load_device"] = model_options["offload_device"] = torch.device("cpu")
+
+        # Load both state dicts using the same safe_load path as comfy.sd.load_clip.
+        gemma_sd, _ = comfy.utils.load_torch_file(gemma_path, safe_load=True, return_metadata=True)
+        audio_sd, _ = comfy.utils.load_torch_file(audio_path, safe_load=True, return_metadata=True)
+
+        # Mirror comfy.sd.load_clip quant conversion behavior.
+        if model_options.get("custom_operations", None) is None:
+            gemma_sd, _ = comfy.utils.convert_old_quants(gemma_sd, model_prefix="", metadata=None)
+            audio_sd, _ = comfy.utils.convert_old_quants(audio_sd, model_prefix="", metadata=None)
+
+        clip_data = [gemma_sd, audio_sd]
 
         # Detect fp8/quantization metadata — use sd.llama_detect exactly as
         # load_text_encoder_state_dicts does (scans all clip_data internally)
@@ -375,7 +500,18 @@ class DramaBoxTextEncoderLoader:
         """Scan known locations for the DramaBox audio-components safetensors."""
         candidates = _list_audio_component_files()
         if candidates:
-            return candidates[0]
+            def _score(path):
+                name = os.path.basename(path).lower()
+                if "audio" in name and "component" in name:
+                    return (0, name)
+                if "dit" in name or "transformer" in name:
+                    return (2, name)
+                return (1, name)
+
+            candidates = sorted(candidates, key=_score)
+            best = candidates[0]
+            if _score(best)[0] < 2:
+                return best
         # Last resort: model_downloader path (may trigger a download)
         try:
             from model_downloader import get_model_path

@@ -235,6 +235,7 @@ def get_model_path(name, cache_dir=None):
             repo_id=DRAMABOX_REPO,
             allow_patterns=[repo_filename],
             local_dir=str(dramabox_dir),
+            local_dir_use_symlinks=False,
             token=os.environ.get("HF_TOKEN"),
         )
     finally:
@@ -283,6 +284,7 @@ def get_gemma_path(cache_dir=None):
         snapshot_download(
             repo_id=GEMMA_REPO,
             local_dir=str(local_dir),
+            local_dir_use_symlinks=False,
             token=os.environ.get("HF_TOKEN"),
         )
     finally:

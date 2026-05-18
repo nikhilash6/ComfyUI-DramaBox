@@ -165,6 +165,19 @@ class DramaBoxOptions:
                         ),
                     },
                 ),
+                "post_generate_model_policy": (
+                    ["keep_loaded", "offload_to_cpu", "unload"],
+                    {
+                        "default": "keep_loaded",
+                        "advanced": True,
+                        "tooltip": (
+                            "Behavior after each generation:\n"
+                            "keep_loaded: fastest next run, highest persistent memory.\n"
+                            "offload_to_cpu: free VRAM but keep models in RAM for faster reuse.\n"
+                            "unload: free VRAM and RAM; next run reloads from disk."
+                        ),
+                    },
+                ),
             }
         }
 
@@ -188,6 +201,7 @@ class DramaBoxOptions:
         duration_multiplier: float = 1.1,
         speed: float = 1.0,
         ref_duration: float = 10.0,
+        post_generate_model_policy: str = "keep_loaded",
     ):
         options = {
             "steps": steps,
@@ -201,6 +215,7 @@ class DramaBoxOptions:
             "duration_multiplier": duration_multiplier,
             "speed": speed,
             "ref_duration": ref_duration,
+            "post_generate_model_policy": str(post_generate_model_policy),
         }
         return (options,)
 

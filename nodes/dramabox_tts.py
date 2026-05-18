@@ -163,6 +163,7 @@ def _find_or_download_gemma_path():
             repo_id=_GEMMA_FP4_REPO,
             allow_patterns=[_GEMMA_FP4_REPO_PATH],
             local_dir=target_dir,
+            local_dir_use_symlinks=False,
             token=os.environ.get("HF_TOKEN"),
         )
     finally:
@@ -412,7 +413,7 @@ def _load_text_encoder(device):
         del _LOADED_TEXT_ENCODER[k]
 
     print(f"[DramaBox] Loading text encoder: {os.path.basename(gemma_path)}")
-    clip_device = "cpu" if str(device) == "cpu" else "default"
+    clip_device = "default"  # follow Comfy's default text-encoder device policy
     (clip,) = DramaBoxTextEncoderLoader().load(gemma_path, clip_device)
     _LOADED_TEXT_ENCODER[cache_key] = clip
     return clip
@@ -523,6 +524,45 @@ def _auto_rescale(cfg: float) -> float:
     return min(1.0, 0.8 + 0.1 * (cfg - 8.0))
 
 
+def _collect_dramabox_patchers() -> list:
+    """Return all internal DramaBox ModelPatchers currently cached."""
+    all_patchers = []
+    for clip in _LOADED_TEXT_ENCODER.values():
+        try:
+            all_patchers.append(clip.patcher)
+        except AttributeError:
+            pass
+    for model in _LOADED_MODELS.values():
+        for group in ("voice_patchers", "xfmr_patchers", "dec_patchers"):
+            all_patchers.extend(model.get(group, []))
+    return all_patchers
+
+
+def _offload_dramabox_models_to_cpu():
+    """Move cached DramaBox models to CPU but keep them in RAM for fast reuse."""
+    import comfy.model_management as mm
+
+    if not _LOADED_MODELS and not _LOADED_TEXT_ENCODER:
+        logger.info("[DramaBox] No models loaded — nothing to offload.")
+        return
+
+    all_patchers = _collect_dramabox_patchers()
+
+    for patcher in all_patchers:
+        try:
+            patcher.unpatch_model(patcher.offload_device)
+        except Exception as e:
+            logger.debug("[DramaBox] unpatch_model failed during offload: %s", e)
+
+    patcher_set = set(id(p) for p in all_patchers)
+    mm.current_loaded_models[:] = [
+        m for m in mm.current_loaded_models if id(m.model) not in patcher_set
+    ]
+
+    mm.soft_empty_cache()
+    logger.info("[DramaBox] Cached models offloaded to CPU (kept in RAM).")
+
+
 def _unload_dramabox_models():
     """Free all DramaBox model weights from GPU and CPU RAM.
 
@@ -539,16 +579,7 @@ def _unload_dramabox_models():
         return
 
     # Collect all internally-managed patchers (external CLIP is user-managed)
-    all_patchers = []
-    for clip in _LOADED_TEXT_ENCODER.values():
-        try:
-            all_patchers.append(clip.patcher)
-        except AttributeError:
-            pass
-    for model in _LOADED_MODELS.values():
-        # ── 1. Move ComfyUI-managed patchers back to CPU ──────────────────
-        for group in ("voice_patchers", "xfmr_patchers", "dec_patchers"):
-            all_patchers.extend(model.get(group, []))
+    all_patchers = _collect_dramabox_patchers()
 
     for patcher in all_patchers:
         try:
@@ -812,15 +843,19 @@ class DramaBoxTTS:
 
         # ── 5. Encode text prompts ───────────────────────────────────────
         # _clip_enc is always a comfy.sd.CLIP — either user-supplied or auto-loaded.
+        # Load the text encoder to GPU just for encoding, then let ComfyUI evict it.
         logger.info("[DramaBox] Encoding prompts…")
+        mm.load_models_gpu([_clip_enc.patcher])
         tokens_pos = _clip_enc.tokenize(used_prompt)
         cond_pos   = _clip_enc.encode_from_tokens(tokens_pos, return_dict=True)
-        a_ctx      = cond_pos["dramabox_audio_encoding"].to(torch_dtype)
+        a_ctx      = cond_pos["cond"].to(device=device, dtype=torch_dtype)
+        del cond_pos, tokens_pos
         a_ctx_neg  = None
         if cfg_scale > 1.0:
             tokens_neg = _clip_enc.tokenize(negative_prompt)
             cond_neg   = _clip_enc.encode_from_tokens(tokens_neg, return_dict=True)
-            a_ctx_neg  = cond_neg["dramabox_audio_encoding"].to(torch_dtype)
+            a_ctx_neg  = cond_neg["cond"].to(device=device, dtype=torch_dtype)
+            del cond_neg, tokens_neg
         mm.soft_empty_cache()
 
         # ── 6. Build denoiser ────────────────────────────────────────────
@@ -912,6 +947,15 @@ class DramaBoxTTS:
         sample_rate = decoded.sampling_rate
         audio_dur = waveform.shape[-1] / sample_rate
         elapsed = time.time() - t_total
+
+        post_mode = str(opts.get("post_generate_model_policy", "keep_loaded"))
+
+        if post_mode == "offload_to_cpu":
+            logger.info("[DramaBox] post_generate_model_policy=offload_to_cpu")
+            _offload_dramabox_models_to_cpu()
+        elif post_mode == "unload":
+            logger.info("[DramaBox] post_generate_model_policy=unload")
+            _unload_dramabox_models()
 
         return ({"waveform": waveform, "sample_rate": sample_rate},)
 
