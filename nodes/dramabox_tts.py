@@ -51,8 +51,8 @@ logger = logging.getLogger(__name__)
 # ── local import bootstrap ────────────────────────────────────────────────────
 _NODE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# Always make local src importable for node-local helpers.
-_SRC_DIR = os.path.join(_NODE_DIR, "src")
+# Always make local py importable for node-local helpers.
+_SRC_DIR = os.path.join(_NODE_DIR, "py")
 if _SRC_DIR not in sys.path:
     sys.path.append(_SRC_DIR)
 
@@ -504,7 +504,7 @@ def _apply_lora_deltas(transformer: torch.nn.Module, lora_path: str, strength: f
     """Apply LoRA weights to transformer in-place using manual delta math.
 
     Handles both PEFT format (base_model.model.*) and original ID-LoRA format
-    (diffusion_model.*), matching the approach in src/inference.py.
+    (diffusion_model.*), matching the approach in py/inference.py.
 
     Returns a list of (param_name, delta_tensor) so the caller can undo the
     changes after inference by subtracting each delta.
@@ -973,7 +973,7 @@ class DramaBoxTTS:
         )
 
         # ── 7. Diffusion sampling ────────────────────────────────────────
-        # Apply LoRAs via manual delta math (matching src/inference.py's PEFT
+        # Apply LoRAs via manual delta math (matching py/inference.py's PEFT
         # approach). Deltas are added before moving the model to GPU and
         # subtracted after inference so the cached transformer stays unmodified.
         xfmr_patchers = model["xfmr_patchers"]

@@ -35,8 +35,8 @@ import torch
 # ── local import bootstrap ────────────────────────────────────────────────────
 _NODE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# Always make local src importable for node-local helpers.
-_SRC_DIR = os.path.join(_NODE_DIR, "src")
+# Always make local py importable for node-local helpers.
+_SRC_DIR = os.path.join(_NODE_DIR, "py")
 if _SRC_DIR not in sys.path:
     sys.path.append(_SRC_DIR)
 
