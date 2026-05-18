@@ -9,6 +9,7 @@ ComfyUI custom nodes for [DramaBox](https://github.com/resemble-ai/DramaBox) —
 | **DramaBox TTS** | Generates speech audio from a text prompt. Optionally accepts a voice reference clip and advanced options. All model weights are downloaded automatically on first use. |
 | **DramaBox CLIP Loader** | Loads a Gemma text encoder from your `text_encoders` folder. Supports `.safetensors` and optional `.gguf` (when ComfyUI-GGUF is installed). Connect to the TTS node's `dramabox_clip` input to override the default encoder. |
 | **DramaBox Options** | Advanced generation settings (steps, CFG scale, duration, memory policy, etc.). (Optional) Connect to the DramaBox TTS node's `options` input. |
+| **DramaBox Unload** | Utility passthrough node that releases both clip_loader and wrapper caches, then returns input unchanged. Useful at workflow boundaries to force memory cleanup. |
 
 ## Text Encoder
 
@@ -36,6 +37,36 @@ The **DramaBox Options** node includes `post_generate_model_policy` with three m
 - `offload` — offload Gemma after text encoding and fully unload DramaBox after generation.
 
 For most users, `offload_to_cpu` is a good balance between memory savings and iteration speed.
+
+## Generation modes (advantages / disadvantages)
+
+Set via **DramaBox Options** (`generation_mode`) or globally in *ComfyUI Settings → DramaBox → Use DramaBox Wrapper mode by default*.
+
+### `clip_loader`
+
+Advantages:
+- Best ComfyUI-native VRAM control.
+- Text encoding and diffusion are staged cleanly (less overlap in VRAM).
+- Best fit when using custom CLIP Loader / GGUF text encoders.
+
+Disadvantages:
+- Not the original native DramaBox warm-server path.
+- Output can differ from native DramaBox (tone, pacing, or phrasing may vary).
+
+### `dramabox_wrapper`
+
+Advantages:
+- Closest to original DramaBox warm-server behavior.
+- Best match when you want native DramaBox-like output.
+
+Disadvantages:
+- In `keep_loaded`, prompt encoder and transformer can overlap in VRAM.
+- ComfyUI cannot fully manage wrapper internals like it does patcher-based models.
+
+Wrapper + memory policy notes:
+- `keep_loaded`: fastest repeated runs, highest VRAM use.
+- `offload_to_cpu` / `offload`: uses one-shot low-memory execution (including LoRA entries) to avoid warm overlap, then releases wrapper cache.
+- Add **DramaBox Unload** to force cleanup at a specific workflow point.
 
 <div align="center">
   <img src="docs/images/example.png" alt="DramaBox">
@@ -88,6 +119,10 @@ Voice LoRAs for DramaBox can be trained with **[Voice Clone Studio — DramaBox 
 ## Changelog
 
 ### May 2026
+- **Generation mode control** — added `generation_mode` (`clip_loader` or `dramabox_wrapper`) in DramaBox Options plus a global default wrapper-mode preference.
+- **Wrapper LoRA parity** — wrapper mode now supports direct LoRA stack/strength application and cleanup, matching non-wrapper behavior.
+- **Wrapper offload behavior** — when wrapper mode uses `offload_to_cpu` / `offload`, it now runs through one-shot low-memory execution (with LoRA support) to reduce VRAM overlap.
+- **DramaBox Unload node** — added a passthrough unload node to release both clip and wrapper caches on demand.
 - **Text encoder overhaul** — DramaBox now uses ComfyUI's standard CLIP infrastructure for the Gemma text encoder, matching the native LTX-2 loading path for correct VRAM management.
 - **Default encoder** — switched to `gemma_3_12B_it_fp4_mixed.safetensors` (ComfyUI/Comfy-Org's own quantized file, ~8 GB vs ~24 GB for the previous bnb-4bit snapshot). Downloaded automatically into `text_encoders/` on first use if not already present.
 - **DramaBox CLIP Loader node** — optional node to load Gemma text encoders from `text_encoders/` (safetensors) and GGUF files when ComfyUI-GGUF is installed. Connect to the TTS node's `dramabox_clip` input for per-workflow encoder selection.

@@ -1513,41 +1513,13 @@ class DramaBoxTTS:
 
             tmp_voice_path = _voice_ref_to_temp_wav(voice_ref)
             try:
-                if normalized_lora_stack:
-                    server = _get_og_server(device)
-                    for lora_name, strength_model, _strength_clip in normalized_lora_stack:
-                        lora_path = _resolve_lora_path(lora_name)
-                        if lora_path is None:
-                            logger.warning("[DramaBox] LoRA not found, skipping: %s", lora_name)
-                            print(f"[DramaBox] Wrapper LoRA missing: {lora_name}")
-                            continue
-                        deltas = _apply_lora_deltas(server._velocity_model, lora_path, float(strength_model))
-                        _applied_deltas.extend(deltas)
-                        print(
-                            f"[DramaBox] Wrapper LoRA applied: {os.path.basename(lora_path)} "
-                            f"(strength={float(strength_model):.2f}, params={len(deltas)})"
-                        )
-                        if not deltas:
-                            print(
-                                f"[DramaBox] Warning: no matching transformer params found for "
-                                f"{os.path.basename(lora_path)}"
-                            )
+                if offload_policy in {"offload_to_cpu", "offload"}:
+                    logger.info("[DramaBox] dramabox_wrapper + offload policy -> one-shot low-memory run")
 
-                    waveform, sample_rate = server.generate(
-                        prompt=used_prompt,
-                        voice_ref=tmp_voice_path,
-                        speed=speed,
-                        cfg_scale=cfg_scale,
-                        stg_scale=stg_scale,
-                        duration_multiplier=duration_mult,
-                        seed=int(seed),
-                        ref_duration=float(ref_duration),
-                        rescale_scale=rescale_raw,
-                        gen_duration=float(gen_duration),
-                    )
-                elif offload_policy in {"offload_to_cpu", "offload"}:
-                    if offload_policy in {"offload_to_cpu", "offload"}:
-                        logger.info("[DramaBox] dramabox_wrapper + offload policy -> one-shot low-memory run")
+                    lora_entries = _resolve_wrapper_loras(normalized_lora_stack)
+                    if normalized_lora_stack and not lora_entries:
+                        print("[DramaBox] Warning: no valid wrapper LoRA entries resolved for one-shot run")
+
                     _release_og_server(device)
                     waveform, sample_rate = _run_og_low_memory_once(
                         used_prompt,
@@ -1562,9 +1534,30 @@ class DramaBoxTTS:
                         steps=steps,
                         negative_prompt=negative_prompt,
                         rescale_raw=rescale_raw,
+                        lora_entries=lora_entries or None,
                     )
                 else:
                     server = _get_og_server(device)
+
+                    if normalized_lora_stack:
+                        for lora_name, strength_model, _strength_clip in normalized_lora_stack:
+                            lora_path = _resolve_lora_path(lora_name)
+                            if lora_path is None:
+                                logger.warning("[DramaBox] LoRA not found, skipping: %s", lora_name)
+                                print(f"[DramaBox] Wrapper LoRA missing: {lora_name}")
+                                continue
+                            deltas = _apply_lora_deltas(server._velocity_model, lora_path, float(strength_model))
+                            _applied_deltas.extend(deltas)
+                            print(
+                                f"[DramaBox] Wrapper LoRA applied: {os.path.basename(lora_path)} "
+                                f"(strength={float(strength_model):.2f}, params={len(deltas)})"
+                            )
+                            if not deltas:
+                                print(
+                                    f"[DramaBox] Warning: no matching transformer params found for "
+                                    f"{os.path.basename(lora_path)}"
+                                )
+
                     waveform, sample_rate = server.generate(
                         prompt=used_prompt,
                         voice_ref=tmp_voice_path,

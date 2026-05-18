@@ -163,11 +163,9 @@ app.registerExtension({
             type: "text",
             defaultValue: "",
             tooltip:
-                "Filename of the Gemma text encoder to auto-load (.safetensors or .gguf). " +
-                "File must exist in your text_encoders folder (or clip_gguf when available). " +
-                "Leave blank to use gemma_3_12B_it_fp4_mixed.safetensors " +
-                "(downloaded automatically on first use). Connect a DramaBox CLIP Loader node " +
-                "to override per-workflow.",
+                "Gemma filename (.safetensors/.gguf) in text_encoders. " +
+                "Leave blank to auto-use gemma_3_12B_it_fp4_mixed.safetensors. " +
+                "Use DramaBox CLIP Loader to override per workflow.",
         },
         {
             id: "DramaBox.autoOffload",
@@ -176,9 +174,8 @@ app.registerExtension({
             type: "boolean",
             defaultValue: true,
             tooltip:
-                "When enabled (recommended), DramaBox offloads Gemma right after prompt " +
-                "encoding and offloads DramaBox models to CPU after generation. Disable " +
-                "if you have very high VRAM and prefer maximum throughput.",
+                "Offload Gemma after prompt encoding and DramaBox models after generation. " +
+                "Disable only if you have high VRAM and want max throughput.",
         },
         {
             id: "DramaBox.defaultWrapperMode",
@@ -187,11 +184,10 @@ app.registerExtension({
             type: "boolean",
             defaultValue: false,
             tooltip:
-                "ON: DramaBox TTS uses a DramaBox Wrapper by default (unless an Options node overrides it). " +
-                "OFF: DramaBox TTS uses a clip_loader by default (best ComfyUI VRAM control). " +
-                "Wrapper LoRA support: supports LoRA stacks and strengths. " +
-                "Wrapper side effects: ComfyUI cannot fully manage wrapper VRAM, so VRAM may stay allocated. " +
-                "Use offload/unload policy or the DramaBox Unload node to free memory after runs.",
+                "ON: use DramaBox Wrapper by default (Options can override). " +
+                "OFF: use clip_loader by default (best VRAM control). " +
+                "Side effect: ComfyUI can not release VRAM automatically; " +
+                "Use offload policy or the DramaBox Unload node.",
         },
     ],
 });
