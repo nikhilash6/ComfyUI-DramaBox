@@ -105,6 +105,37 @@ def _get_dramabox_setting(key, default=None):
         pass
     return default
 
+
+def _get_dramabox_bool_setting(key: str, default: bool = False) -> bool:
+    """Read a boolean DramaBox user setting with tolerant coercion."""
+    v = _get_dramabox_setting(key, default)
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        return v.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(default)
+
+
+def _offload_clip_patcher_to_cpu(clip_obj) -> None:
+    """Offload a CLIP patcher to CPU and remove it from loaded-GPU tracking."""
+    import comfy.model_management as mm
+
+    patcher = getattr(clip_obj, "patcher", None)
+    if patcher is None:
+        return
+
+    try:
+        patcher.unpatch_model(patcher.offload_device)
+    except Exception as e:
+        logger.debug("[DramaBox] clip patcher offload failed: %s", e)
+
+    mm.current_loaded_models[:] = [
+        m for m in mm.current_loaded_models if id(m.model) != id(patcher)
+    ]
+    mm.soft_empty_cache()
+
 def _find_or_download_gemma_path():
     """Return a local path to the default Gemma safetensors.
 
@@ -666,13 +697,13 @@ class DramaBoxTTS:
                         "tooltip": "Connect any text source here to override the text widget.",
                     },
                 ),
-                "options": (
-                    "DRAMABOX_OPTIONS",
-                    {"tooltip": "Connect DramaBox Options for cfg, steps, duration, and more."},
-                ),
                 "lora_stack": (
                     "LORA_STACK",
                     {"tooltip": "Optional LoRA stack (from any LoRA stacker node). Applied to the transformer only."},
+                ),
+                "options": (
+                    "DRAMABOX_OPTIONS",
+                    {"tooltip": "Connect DramaBox Options for cfg, steps, duration, and more."},
                 ),
                 "dramabox_clip": (
                     "CLIP",
@@ -856,6 +887,33 @@ class DramaBoxTTS:
             cond_neg   = _clip_enc.encode_from_tokens(tokens_neg, return_dict=True)
             a_ctx_neg  = cond_neg["cond"].to(device=device, dtype=torch_dtype)
             del cond_neg, tokens_neg
+
+        # Guided denoising concatenates positive/negative contexts along batch,
+        # so sequence length must match. Prompt trimming may produce different
+        # lengths (e.g. 256 vs 128), so pad the shorter one on the left.
+        if a_ctx_neg is not None and a_ctx.dim() == 3 and a_ctx_neg.dim() == 3:
+            if a_ctx.shape[1] != a_ctx_neg.shape[1]:
+                target_len = max(a_ctx.shape[1], a_ctx_neg.shape[1])
+
+                def _left_pad_ctx(ctx: torch.Tensor, tgt: int) -> torch.Tensor:
+                    cur = ctx.shape[1]
+                    if cur >= tgt:
+                        return ctx[:, -tgt:, :]
+                    pad = ctx.new_zeros((ctx.shape[0], tgt - cur, ctx.shape[2]))
+                    return torch.cat((pad, ctx), dim=1)
+
+                logger.info(
+                    "[DramaBox] Aligning context lengths for CFG: pos=%d neg=%d -> %d",
+                    a_ctx.shape[1], a_ctx_neg.shape[1], target_len,
+                )
+                a_ctx = _left_pad_ctx(a_ctx, target_len)
+                a_ctx_neg = _left_pad_ctx(a_ctx_neg, target_len)
+
+        # Default-on behavior: offload Gemma to CPU right after text encoding.
+        # Can be disabled in Comfy Settings > DramaBox > Text Encoder > Memory.
+        if _get_dramabox_bool_setting("DramaBox.offloadTextEncoderAfterEncode", True):
+            _offload_clip_patcher_to_cpu(_clip_enc)
+
         mm.soft_empty_cache()
 
         # ── 6. Build denoiser ────────────────────────────────────────────

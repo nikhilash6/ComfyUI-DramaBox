@@ -168,6 +168,17 @@ app.registerExtension({
                 "(downloaded automatically on first use). Connect a DramaBox CLIP Loader node " +
                 "to override per-workflow.",
         },
+        {
+            id: "DramaBox.offloadTextEncoderAfterEncode",
+            name: "Offload text encoder after prompt encoding",
+            category: ["DramaBox", "Text Encoder", "Memory"],
+            type: "boolean",
+            defaultValue: true,
+            tooltip:
+                "When enabled (recommended), DramaBox offloads Gemma to CPU right after " +
+                "prompt encoding. This lowers VRAM pressure for diffusion stages. Disable " +
+                "if you prefer maximum throughput on very high-VRAM GPUs.",
+        },
     ],
 });
 

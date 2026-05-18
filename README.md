@@ -8,7 +8,7 @@ ComfyUI custom nodes for [DramaBox](https://github.com/resemble-ai/DramaBox) —
 |------|-------------|
 | **DramaBox TTS** | Generates speech audio from a text prompt. Optionally accepts a voice reference clip and advanced options. All model weights are downloaded automatically on first use. |
 | **DramaBox CLIP Loader** | Loads a Gemma text encoder from your `text_encoders` folder. (Optional) Connect to the TTS node's `dramabox_clip` input to override the default encoder. |
-| **DramaBox Options** | Advanced generation settings (steps, CFG scale, duration, etc.). (Optional) Connect to the DramaBox TTS node's `options` input. |
+| **DramaBox Options** | Advanced generation settings (steps, CFG scale, duration, memory policy, etc.). (Optional) Connect to the DramaBox TTS node's `options` input. |
 
 ## Text Encoder
 
@@ -18,7 +18,19 @@ DramaBox uses a Gemma 3 12B text encoder. By default the node loads **`gemma_3_1
 
 **Per-installation preference** — open *ComfyUI Settings → DramaBox → Default Text Encoder filename* and enter the filename of any Gemma safetensors already in your `text_encoders` folder (e.g. `gemma_3_12b_it_fp8_scaled.safetensors`). Leave it blank to keep the fp4 default.
 
+**Memory preference** — open *ComfyUI Settings → DramaBox → Text Encoder → Memory* and keep **Offload text encoder after prompt encoding** enabled (default) to move Gemma back to CPU immediately after text encoding. This lowers VRAM usage for the diffusion stages. If you have plenty of VRAM and prefer maximum throughput, you can disable it.
+
 **Per-workflow override** — add a **DramaBox CLIP Loader** node, select the model you want, and connect its output to the TTS node's `dramabox_clip` input. This takes precedence over the global preference and lets you switch encoders between workflows without touching settings.
+
+### Post-generate memory policy (Options node)
+
+The **DramaBox Options** node includes `post_generate_model_policy` with three modes:
+
+- `keep_loaded` — fastest next run, highest persistent memory usage.
+- `offload_to_cpu` — unloads DramaBox models from VRAM after generation but keeps them in CPU RAM for faster reuse.
+- `unload` — fully unloads models from both VRAM and RAM; next run reloads from disk.
+
+For most users, `offload_to_cpu` is a good balance between memory savings and iteration speed.
 
 <div align="center">
   <img src="docs/images/example.png" alt="DramaBox">
