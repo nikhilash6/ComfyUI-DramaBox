@@ -49,6 +49,105 @@ from comfy.text_encoders.lt import Gemma3_12BModel, LTXAVGemmaTokenizer
 logger = logging.getLogger(__name__)
 
 
+def _fix_rope_position_ids(transformer) -> None:
+    """Patch a LlamaModel instance to use HuggingFace-style RoPE position_ids.
+
+    ComfyUI's LlamaModel.forward computes position_ids = arange(seq_len) when
+    position_ids is None.  For a left-padded 1024-token sequence with 32 real
+    tokens this assigns RoPE positions 992-1023 to the real tokens, whereas
+    HuggingFace Gemma3 uses cumsum(attention_mask)-1 so real tokens always
+    start at position 0.  DramaBox's EmbeddingsProcessor was trained with the
+    HuggingFace convention, so we patch the transformer instance once at init
+    time and leave all higher-level encode_token_weights calls unchanged.
+    """
+    if getattr(transformer, '_hf_rope_position_ids_fixed', False):
+        return
+    _orig_forward = transformer.forward
+
+    def _fixed_forward(x, attention_mask=None, **kwargs):
+        if kwargs.get('position_ids') is None and attention_mask is not None:
+            kwargs['position_ids'] = (
+                attention_mask.long().cumsum(dim=-1) - 1
+            ).clamp(min=0)
+        return _orig_forward(x, attention_mask, **kwargs)
+
+    transformer.forward = _fixed_forward
+    transformer._hf_rope_position_ids_fixed = True
+
+
+def _find_bnb_gemma_root() -> "str | None":
+    """Return path to the downloaded unsloth/gemma-3-12b-it-bnb-4bit directory.
+
+    Does NOT trigger a download — only returns a path if the directory is
+    already present on disk (i.e. the user has run the DramaBox wrapper at
+    least once, which downloads it automatically).
+    """
+    try:
+        _py_dir = os.path.join(_NODE_DIR, "py")
+        if _py_dir not in sys.path:
+            sys.path.insert(0, _py_dir)
+        from model_downloader import GEMMA_REPO, _resolve_models_dir
+        models_dir = _resolve_models_dir(None)
+        gemma_name = GEMMA_REPO.split("/")[-1]
+        candidate = models_dir / "dramabox" / gemma_name
+        if candidate.is_dir() and any(candidate.iterdir()):
+            return str(candidate)
+    except Exception:
+        pass
+    return None
+
+
+def _load_bnb_encoder(bnb_root: str, dtype: "torch.dtype", device):
+    """Load a GemmaTextEncoder backed by the BNB NF4-quantized Gemma directory.
+
+    This replicates dramabox_ltx_compat._load_bnb_4bit_encoder so that the
+    clip_loader path produces hidden states identical to the wrapper path.
+    """
+    import json
+    from transformers import BitsAndBytesConfig, Gemma3ForConditionalGeneration
+    from ltx_core.text_encoders.gemma.encoders.base_encoder import GemmaTextEncoder
+    from ltx_core.text_encoders.gemma.tokenizer import LTXVGemmaTokenizer
+    from ltx_core.utils import find_matching_file
+
+    try:
+        import bitsandbytes as _bnb
+        _bnb.functional.get_4bit_type("nf4")
+    except Exception as exc:
+        raise RuntimeError(
+            f"[DramaBox] bitsandbytes is not available — cannot use BNB NF4 encoder: {exc}\n"
+            "Install bitsandbytes or fall back to a safetensors Gemma file."
+        ) from exc
+
+    prequantized = False
+    cfg_path = os.path.join(bnb_root, "config.json")
+    if os.path.exists(cfg_path):
+        try:
+            with open(cfg_path, encoding="utf-8") as f:
+                cfg = json.load(f)
+            prequantized = "quantization_config" in cfg
+        except Exception:
+            prequantized = False
+
+    from_kwargs: dict = {
+        "device_map": str(device) if not isinstance(device, str) else device,
+        "torch_dtype": dtype if dtype is not None else torch.bfloat16,
+    }
+    if not prequantized:
+        from_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=from_kwargs["torch_dtype"],
+        )
+
+    logger.info("[DramaBox] Loading BNB NF4 Gemma encoder from %s", bnb_root)
+    hf_model = Gemma3ForConditionalGeneration.from_pretrained(bnb_root, **from_kwargs)
+    tokenizer = LTXVGemmaTokenizer(
+        str(find_matching_file(bnb_root, "tokenizer.model").parent),
+        1024,
+    )
+    return GemmaTextEncoder(model=hf_model, tokenizer=tokenizer, dtype=from_kwargs["torch_dtype"])
+
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DramaBoxTEModel
@@ -71,20 +170,43 @@ class DramaBoxTEModel(torch.nn.Module):
         dtype=None,
         model_options={},
         audio_components_path=None,
+        bnb_gemma_root=None,
     ):
         super().__init__()
         self.dtypes = set()
         self.dtypes.add(dtype)
         self.execution_device = None
+        # _bnb_encoder is intentionally NOT stored via nn.Module.__setattr__ so
+        # that ComfyUI's ModelPatcher never sees the BNB Params4bit weights.
+        # We use object.__setattr__ to bypass nn.Module's registry entirely.
+        # It is loaded lazily at first encode time (so it lands on the correct
+        # GPU device rather than the "cpu" device used during init).
+        object.__setattr__(self, '_bnb_encoder', None)
 
-        self.gemma3_12b = Gemma3_12BModel(
-            device=device,
-            dtype=dtype_llama,
-            model_options=model_options,
-            layer="all",
-            layer_idx=None,
-        )
-        self.dtypes.add(dtype_llama)
+        if bnb_gemma_root is not None:
+            # BNB mode: encode via HuggingFace BNB NF4-quantized Gemma model.
+            # Gemma weights are NOT loaded into self.gemma3_12b — the BNB encoder
+            # owns them.  We store the root path and dtype for lazy loading.
+            self.gemma3_12b = None
+            bnb_dtype = dtype_llama if dtype_llama is not None else (dtype or torch.bfloat16)
+            object.__setattr__(self, '_bnb_gemma_root', bnb_gemma_root)
+            object.__setattr__(self, '_bnb_dtype', bnb_dtype)
+            self.dtypes.add(bnb_dtype)
+        else:
+            object.__setattr__(self, '_bnb_gemma_root', None)
+            object.__setattr__(self, '_bnb_dtype', None)
+            # ComfyUI mode: standard LlamaModel via Gemma3_12BModel.
+            self.gemma3_12b = Gemma3_12BModel(
+                device=device,
+                dtype=dtype_llama,
+                model_options=model_options,
+                layer="all",
+                layer_idx=None,
+            )
+            # Fix RoPE position_ids on the underlying LlamaModel so that
+            # encode_token_weights works correctly for left-padded sequences.
+            _fix_rope_position_ids(self.gemma3_12b.transformer)
+            self.dtypes.add(dtype_llama)
 
         # Build EmbeddingsProcessor on the initial device.
         # Weights are random here and will be overwritten by load_sd().
@@ -170,9 +292,24 @@ class DramaBoxTEModel(torch.nn.Module):
                     if isinstance(hidden_states, (list, tuple))
                     else hidden_states
                 )
+                logger.debug(
+                    "[DramaBox] encoded shape=%s dtype=%s is_tuple=%s "
+                    "mean=%.4f std=%.4f",
+                    tuple(encoded.shape), encoded.dtype,
+                    isinstance(hidden_states, (list, tuple)),
+                    encoded.float().mean().item(), encoded.float().std().item(),
+                )
                 normed = norm_and_concat_per_token_rms(encoded, attention_mask).to(encoded.dtype)
+                logger.debug(
+                    "[DramaBox] normed shape=%s mean=%.4f std=%.4f",
+                    tuple(normed.shape), normed.float().mean().item(), normed.float().std().item(),
+                )
                 a_dim = self.audio_aggregate_embed.out_features
                 audio = self.audio_aggregate_embed(_rescale_norm(normed, a_dim, self.embedding_dim))
+                logger.debug(
+                    "[DramaBox] audio shape=%s mean=%.4f std=%.4f",
+                    tuple(audio.shape), audio.float().mean().item(), audio.float().std().item(),
+                )
                 video = audio.new_zeros((audio.shape[0], audio.shape[1], 1))
                 return video, audio
 
@@ -206,49 +343,85 @@ class DramaBoxTEModel(torch.nn.Module):
 
     def set_clip_options(self, options):
         self.execution_device = options.get("execution_device", self.execution_device)
-        self.gemma3_12b.set_clip_options(options)
+        if self.gemma3_12b is not None:
+            self.gemma3_12b.set_clip_options(options)
 
     def reset_clip_options(self):
-        self.gemma3_12b.reset_clip_options()
+        if self.gemma3_12b is not None:
+            self.gemma3_12b.reset_clip_options()
         self.execution_device = None
 
     # ── Core encoding ────────────────────────────────────────────────────────
 
+    def _encode_token_weights_bnb(self, token_weight_pairs):
+        """Encode via the BNB NF4 HuggingFace Gemma model.
+
+        Extracts token IDs and the attention mask from the ComfyUI
+        token_weight_pairs (same tokenizer, same IDs) and calls the HuggingFace
+        model's inner language model directly, bypassing the lm_head to save
+        memory.  Returns hidden states in the same [B, T, D, L] format that
+        the EmbeddingsProcessor expects.
+        """
+        # Lazy-load the BNB encoder on first call so it lands on the GPU
+        # device ComfyUI selects rather than the cpu used during init.
+        # _bnb_encoder is stored via object.__setattr__ so ModelPatcher
+        # never sees the BNB Params4bit weights.
+        if self._bnb_encoder is None:
+            dev = comfy.model_management.get_torch_device()
+            encoder = _load_bnb_encoder(self._bnb_gemma_root, self._bnb_dtype, dev)
+            object.__setattr__(self, '_bnb_encoder', encoder)
+        token_weight_pairs_g = token_weight_pairs["gemma3_12b"]
+
+        # token_weight_pairs_g is a list (batch) of lists of (token_id, weight).
+        # The weight is the attention mask value (1 = real token, 0 = padding).
+        input_ids_list   = [[int(t[0]) for t in seq] for seq in token_weight_pairs_g]
+        attn_mask_list   = [[int(bool(t[1])) for t in seq] for seq in token_weight_pairs_g]
+
+        hf_model = self._bnb_encoder.model
+        dev = next(hf_model.parameters()).device
+        input_ids    = torch.tensor(input_ids_list,  dtype=torch.long, device=dev)
+        attn_mask    = torch.tensor(attn_mask_list,  dtype=torch.long, device=dev)
+
+        with torch.inference_mode():
+            outputs = hf_model.model(
+                input_ids=input_ids,
+                attention_mask=attn_mask,
+                output_hidden_states=True,
+            )
+
+        # outputs.hidden_states: tuple of (num_layers+1) tensors [B, T, D]
+        # Stack → [B, T, D, L] which is what EmbeddingsProcessor.process_hidden_states expects.
+        out = torch.stack(outputs.hidden_states, dim=-1).float()  # [B, T, D, L]
+        del outputs
+
+        # Wrapper parity: keep the full padded sequence and let
+        # EmbeddingsProcessor handle masking internally.
+        attention_mask = attn_mask.cpu()
+
+        ep_device = next(self.embeddings_processor.parameters()).device
+        ep_dtype  = next(self.embeddings_processor.parameters()).dtype
+        ep_out = self.embeddings_processor.process_hidden_states(
+            out.to(device=ep_device, dtype=ep_dtype),
+            attention_mask.to(ep_device),
+            "left",
+        )
+
+        return (ep_out.audio_encoding, None, {})
+
     def encode_token_weights(self, token_weight_pairs):
+        if self._bnb_gemma_root is not None:
+            return self._encode_token_weights_bnb(token_weight_pairs)
+
         token_weight_pairs_g = token_weight_pairs["gemma3_12b"]
 
         # [B, L, T, D]  —  L=49 layers, T=seq_len, D=3840
+        # The underlying LlamaModel has been patched at init time (_fix_rope_position_ids)
+        # to use HF-style cumsum position_ids, so this call is correct as-is.
         out, _pooled, extra = self.gemma3_12b.encode_token_weights(token_weight_pairs_g)
+        out = out.float()
 
         # Binary attention mask [B, T] (1 = valid token, 0 = padding)
         attention_mask = extra["attention_mask"]
-
-        # Trim padded-token tail for memory savings, but preserve connector constraints.
-        # Embeddings1DConnector with learnable registers requires seq_len to be a
-        # multiple of num_learnable_registers (typically 128).
-        valid_tokens = int(attention_mask.sum(dim=-1).max().item())
-        seq_len = out.shape[2]
-        keep_tokens = seq_len
-
-        num_regs = None
-        try:
-            num_regs = getattr(self.embeddings_processor.audio_connector, "num_learnable_registers", None)
-        except Exception:
-            num_regs = None
-
-        if num_regs and num_regs > 0:
-            rounded = ((max(1, valid_tokens) + num_regs - 1) // num_regs) * num_regs
-            keep_tokens = max(num_regs, min(seq_len, rounded))
-            # If clamped by seq_len, ensure divisibility is still preserved.
-            keep_tokens = (keep_tokens // num_regs) * num_regs
-            if keep_tokens <= 0:
-                keep_tokens = seq_len
-        elif valid_tokens > 0:
-            keep_tokens = min(seq_len, valid_tokens)
-
-        if seq_len > keep_tokens:
-            out = out[:, :, -keep_tokens:]
-            attention_mask = attention_mask[:, -keep_tokens:]
 
         # → [B, T, D, L]  (DramaBox FeatureExtractor accepts this directly)
         out = out.movedim(1, -1)
@@ -288,8 +461,13 @@ class DramaBoxTEModel(torch.nn.Module):
     }
 
     def load_sd(self, sd):
-        # Gemma checkpoint — detected by a Gemma-specific key
+        # Gemma checkpoint — detected by a Gemma-specific key.
+        # In BNB mode the Gemma weights are already loaded from the BNB directory;
+        # skip the safetensors Gemma SD entirely (it was only loaded to satisfy
+        # ComfyUI's CLIP state-dict pipeline and can be discarded).
         if "model.layers.47.self_attn.q_norm.weight" in sd:
+            if self._bnb_gemma_root is not None:
+                return ([], [])  # BNB mode — Gemma weights are irrelevant here
             missing, unexpected = self.gemma3_12b.load_sd(sd)
             # DramaBox uses Gemma as a text-only encoder.  GGUF and safetensors
             # exports of Gemma 3 12B omit the vision tower; filter those keys so
@@ -343,7 +521,12 @@ class DramaBoxTEModel(torch.nn.Module):
         return max(num_tokens, 642) * constant * 1024 * 1024
 
 
-def dramabox_te(dtype_llama=None, llama_quantization_metadata=None, audio_components_path=None):
+def dramabox_te(
+    dtype_llama=None,
+    llama_quantization_metadata=None,
+    audio_components_path=None,
+    bnb_gemma_root=None,
+):
     """Factory that returns a DramaBoxTEModel subclass capturing checkpoint params."""
 
     class DramaBoxTEModel_(DramaBoxTEModel):
@@ -359,6 +542,7 @@ def dramabox_te(dtype_llama=None, llama_quantization_metadata=None, audio_compon
                 dtype=dtype_eff,
                 model_options=mo,
                 audio_components_path=audio_components_path,
+                bnb_gemma_root=bnb_gemma_root,
             )
 
     return DramaBoxTEModel_
@@ -510,6 +694,17 @@ class DramaBoxTextEncoderLoader:
                 ),
             },
             "optional": {
+                "encoder_backend": (
+                    ["comfy_clip", "dramabox_bnb_experimental"],
+                    {
+                        "advanced": True,
+                        "tooltip": (
+                            "Backend for text encoding. 'comfy_clip' uses the selected text_encoder file "
+                            "with ComfyUI VRAM management. 'dramabox_bnb_experimental' uses the downloaded "
+                            "unsloth BNB directory when available."
+                        ),
+                    },
+                ),
                 "device": (
                     ["default", "cpu"],
                     {"advanced": True, "tooltip": "Force CPU offload for the text encoder."},
@@ -517,7 +712,7 @@ class DramaBoxTextEncoderLoader:
             },
         }
 
-    def load(self, gemma_model, device="default"):
+    def load(self, gemma_model, device="default", encoder_backend="comfy_clip"):
         # ── mirror LTXAVTextEncoderLoader / load_text_encoder_state_dicts ──
         # Accept either a bare filename (from the dropdown) or a full absolute
         # path (when called programmatically from _load_text_encoder).
@@ -536,6 +731,30 @@ class DramaBoxTextEncoderLoader:
         model_options = {}
         if device == "cpu":
             model_options["load_device"] = model_options["offload_device"] = torch.device("cpu")
+
+        # ── Optional BNB mode (explicit opt-in) ──
+        # Do not auto-switch to BNB just because the directory exists; default
+        # behavior should always respect the selected text_encoder file.
+        if encoder_backend == "dramabox_bnb_experimental":
+            bnb_root = _find_bnb_gemma_root()
+            if bnb_root is None:
+                raise FileNotFoundError(
+                    "[DramaBox] encoder_backend=dramabox_bnb_experimental was requested, but "
+                    "the downloaded BNB directory was not found. Run the DramaBox wrapper once "
+                    "or switch encoder_backend to comfy_clip."
+                )
+            try:
+                return self._load_bnb(
+                    bnb_root=bnb_root,
+                    audio_path=audio_path,
+                    model_options=model_options,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"[DramaBox] BNB backend failed to load: {exc}"
+                ) from exc
+
+        # ── Safetensors / GGUF mode ──
 
         # Load Gemma state dict from safetensors or GGUF.
         gguf_model_patcher = None
@@ -608,6 +827,61 @@ class DramaBoxTextEncoderLoader:
                 clip.patcher = gguf_model_patcher.clone(clip.patcher)
             except Exception as e:
                 logger.debug("[DramaBox] GGUF patcher clone skipped: %s", e)
+        return (clip,)
+
+    def _load_bnb(self, bnb_root: str, audio_path: str, model_options: dict):
+        """Build a ComfyUI CLIP backed by the BNB NF4-quantized Gemma directory.
+
+        The BNB model is loaded directly into DramaBoxTEModel via _load_bnb_encoder;
+        only the EmbeddingsProcessor weights come from audio_path.  The SentencePiece
+        tokenizer model is read from the BNB directory so no separate safetensors is needed.
+        """
+        import comfy.text_encoders.long_clipl as _long_clipl
+        from ltx_core.utils import find_matching_file
+
+        logger.info("[DramaBox] Using BNB NF4 Gemma encoder from %s", bnb_root)
+
+        # Load only the EP (audio components) state dict.
+        audio_sd, _ = comfy.utils.load_torch_file(audio_path, safe_load=True, return_metadata=True)
+        audio_sd, _ = comfy.utils.convert_old_quants(audio_sd, model_prefix="", metadata=None)
+
+        # Load the SentencePiece tokenizer binary from the BNB directory.
+        spiece_path = str(find_matching_file(bnb_root, "tokenizer.model"))
+        with open(spiece_path, "rb") as f:
+            spiece_bytes = f.read()
+        spiece_tensor = torch.frombuffer(bytearray(spiece_bytes), dtype=torch.uint8)
+
+        clip_data = [audio_sd]
+
+        class _ClipTarget:
+            pass
+
+        clip_target = _ClipTarget()
+        clip_target.params = {}
+        clip_target.clip = dramabox_te(
+            dtype_llama=None,
+            llama_quantization_metadata=None,
+            audio_components_path=audio_path,
+            bnb_gemma_root=bnb_root,
+        )
+        clip_target.tokenizer = LTXAVGemmaTokenizer
+
+        tokenizer_data = {"spiece_model": spiece_tensor}
+        for c in clip_data:
+            tokenizer_data, model_options = _long_clipl.model_options_long_clip(
+                c, tokenizer_data, model_options
+            )
+
+        parameters = sum(comfy.utils.calculate_parameters(c) for c in clip_data)
+
+        clip = comfy.sd.CLIP(
+            clip_target,
+            embedding_directory=folder_paths.get_folder_paths("embeddings"),
+            parameters=parameters,
+            tokenizer_data=tokenizer_data,
+            state_dict=clip_data,
+            model_options=model_options,
+        )
         return (clip,)
 
     @staticmethod

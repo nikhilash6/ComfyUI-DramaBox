@@ -860,6 +860,53 @@ def _auto_rescale(cfg: float) -> float:
     return min(1.0, 0.8 + 0.1 * (cfg - 8.0))
 
 
+def _is_cuda_cpu_device_mismatch(exc: RuntimeError) -> bool:
+    """Return True for common torch CUDA/CPU mixed-tensor runtime errors."""
+    msg = str(exc).lower()
+    return (
+        "expected all tensors to be on the same device" in msg
+        and "cuda" in msg
+        and "cpu" in msg
+    )
+
+
+def _is_cuda_oom(exc: RuntimeError) -> bool:
+    """Return True for common CUDA out-of-memory runtime errors."""
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    msg = str(exc).lower()
+    if "cuda error: out of memory" in msg:
+        return True
+    return "out of memory" in msg and any(tok in msg for tok in ("cuda", "cudnn", "cublas"))
+
+
+def _build_device_mismatch_message(generation_mode: str, offload_policy: str) -> str:
+    return (
+        "[DramaBox] Denoising failed due to mixed CUDA/CPU tensors.\n"
+        "Likely cause: VRAM pressure caused a partial transformer load.\n"
+        f"Current mode: {generation_mode}, post_generate_model_policy: {offload_policy}.\n"
+        "Recommended actions:\n"
+        "1. Set post_generate_model_policy to offload_to_cpu or offload.\n"
+        "2. Avoid keep_loaded on lower VRAM systems.\n"
+        "3. Run DramaBox Unload once, then retry.\n"
+        "4. Close other heavy models/workflows.\n"
+        "5. If needed, use dramabox_wrapper with offload_to_cpu."
+    )
+
+
+def _build_cuda_oom_message(generation_mode: str, offload_policy: str) -> str:
+    return (
+        "[DramaBox] Denoising failed due to CUDA out-of-memory (OOM).\n"
+        f"Current mode: {generation_mode}, post_generate_model_policy: {offload_policy}.\n"
+        "Recommended actions:\n"
+        "1. Set post_generate_model_policy to offload_to_cpu or offload.\n"
+        "2. Avoid keep_loaded on lower VRAM systems.\n"
+        "3. Run DramaBox Unload once, then retry.\n"
+        "4. Close other heavy models/workflows.\n"
+        "5. If needed, use dramabox_wrapper with offload_to_cpu."
+    )
+
+
 def _collect_dramabox_patchers() -> list:
     """Return all internal DramaBox ModelPatchers currently cached."""
     all_patchers = []
@@ -1230,6 +1277,33 @@ def unload_all_dramabox_caches() -> tuple[int, int]:
     return clip_released, og_released
 
 
+def _summarize_voice_ref(voice_ref) -> str:
+    """Build a concise debug summary for ComfyUI AUDIO input."""
+    if voice_ref is None:
+        return "none"
+    if not isinstance(voice_ref, dict):
+        return f"invalid type={type(voice_ref)}"
+
+    waveform = voice_ref.get("waveform")
+    sample_rate = voice_ref.get("sample_rate")
+    if waveform is None or sample_rate is None:
+        return "missing waveform/sample_rate"
+
+    if not torch.is_tensor(waveform):
+        return f"waveform is not tensor (type={type(waveform)}), sr={sample_rate}"
+
+    shape = tuple(waveform.shape)
+    dtype = str(waveform.dtype)
+    device = str(waveform.device)
+    samples = int(shape[-1]) if len(shape) > 0 else 0
+    duration = (samples / float(sample_rate)) if sample_rate else 0.0
+    peak = float(waveform.detach().abs().max().item()) if waveform.numel() > 0 else 0.0
+    return (
+        f"shape={shape}, sr={int(sample_rate)}, duration={duration:.2f}s, "
+        f"dtype={dtype}, device={device}, peak={peak:.4f}"
+    )
+
+
 def _voice_ref_to_temp_wav(voice_ref):
     """Write ComfyUI AUDIO input to a temporary wav file and return its path."""
     if voice_ref is None:
@@ -1238,6 +1312,7 @@ def _voice_ref_to_temp_wav(voice_ref):
     waveform = voice_ref.get("waveform") if isinstance(voice_ref, dict) else None
     sample_rate = voice_ref.get("sample_rate") if isinstance(voice_ref, dict) else None
     if waveform is None or sample_rate is None:
+        logger.info("[DramaBox] voice_ref temp wav skipped: missing waveform/sample_rate")
         return None
 
     import tempfile
@@ -1249,6 +1324,12 @@ def _voice_ref_to_temp_wav(voice_ref):
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         sf.write(tmp.name, wav, int(sample_rate))
+        logger.info(
+            "[DramaBox] voice_ref temp wav created: %s (sr=%d, samples=%d)",
+            tmp.name,
+            int(sample_rate),
+            int(wav.shape[0]) if wav.ndim >= 1 else 0,
+        )
         return tmp.name
 
 
@@ -1325,8 +1406,10 @@ def _run_og_low_memory_once(
 
     if voice_ref_path:
         cmd.extend(["--voice-sample", str(voice_ref_path)])
+        logger.info("[DramaBox] one-shot wrapper: passing --voice-sample")
     else:
         cmd.append("--no-ref")
+        logger.info("[DramaBox] one-shot wrapper: no voice sample provided")
 
     if lora_entries:
         for lora_path, lora_strength, lora_rank in lora_entries:
@@ -1470,6 +1553,10 @@ class DramaBoxTTS:
         # Use connected text source when the toggle is on, else fall back to widget text
         used_prompt = prompt if (use_prompt_input and prompt) else text
 
+        vr_summary = _summarize_voice_ref(voice_ref)
+        logger.info("[DramaBox] voice_ref input summary: %s", vr_summary)
+        print(f"[DramaBox] voice_ref input summary: {vr_summary}")
+
         # Notify the frontend so it can display the active prompt in the widget
         if unique_id is not None and _PromptServer is not None:
             try:
@@ -1512,6 +1599,12 @@ class DramaBoxTTS:
             _applied_deltas: list = []
 
             tmp_voice_path = _voice_ref_to_temp_wav(voice_ref)
+            if tmp_voice_path:
+                logger.info("[DramaBox] wrapper voice_ref temp path ready")
+                print("[DramaBox] wrapper voice_ref: temp wav ready")
+            else:
+                logger.info("[DramaBox] wrapper voice_ref missing/invalid; running without reference")
+                print("[DramaBox] wrapper voice_ref: none (running without reference)")
             try:
                 if offload_policy in {"offload_to_cpu", "offload"}:
                     logger.info("[DramaBox] dramabox_wrapper + offload policy -> one-shot low-memory run")
@@ -1662,82 +1755,105 @@ class DramaBoxTTS:
         if voice_ref is not None:
             try:
                 from ltx_pipelines.utils.media_io import decode_audio_from_file
-                import tempfile, soundfile as sf
 
-                waveform = voice_ref["waveform"]          # [B, C, S]
-                sr_in: int = voice_ref["sample_rate"]
-                wav = waveform[0].cpu().float().numpy()   # [C, S]
-                if wav.ndim == 2:
-                    wav = wav.T                           # → [S, C]
-
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                    sf.write(tmp.name, wav, sr_in)
-                    tmp_path = tmp.name
+                tmp_voice_path = _voice_ref_to_temp_wav(voice_ref)
+                if not tmp_voice_path:
+                    raise ValueError("voice_ref is missing waveform/sample_rate")
 
                 try:
-                    voice = decode_audio_from_file(tmp_path, device, 0.0, ref_duration)
+                    voice = decode_audio_from_file(tmp_voice_path, device, 0.0, ref_duration)
                 finally:
                     try:
-                        os.unlink(tmp_path)
+                        os.unlink(tmp_voice_path)
                     except OSError:
                         pass
 
-                if voice is not None:
-                    w = voice.waveform
-                    if w.dim() == 2:
-                        w = w.repeat(2, 1) if w.shape[0] == 1 else w
-                        w = w.unsqueeze(0)
-                    elif w.dim() == 3 and w.shape[1] == 1:
-                        w = w.repeat(1, 2, 1)
-                    n_ref = int(ref_duration * voice.sampling_rate)
-                    if w.shape[-1] < n_ref:
-                        w = w.repeat(1, 1, (n_ref // w.shape[-1]) + 1)
-                    w = w[..., :n_ref]
-                    peak = w.abs().max()
-                    if peak > 0:
-                        w = w * (10 ** (-4.0 / 20) / peak)
-                    voice = Audio(waveform=w, sampling_rate=voice.sampling_rate)
-                    ref_latent = audio_cond(lambda enc: vae_encode_audio(voice, enc, None))
-                    cond = AudioConditionByReferenceLatent(
-                        latent=ref_latent.to(device, torch_dtype), strength=1.0
-                    )
-                    state = cond.apply_to(state, audio_tools)
-                    logger.info("[DramaBox] Voice reference encoded.")
+                if voice is None:
+                    raise ValueError("decode_audio_from_file returned no audio")
+
+                logger.info(
+                    "[DramaBox] voice_ref decoded: sr=%d, waveform_shape=%s",
+                    int(voice.sampling_rate),
+                    tuple(voice.waveform.shape),
+                )
+                print(
+                    "[DramaBox] voice_ref decoded: "
+                    f"sr={int(voice.sampling_rate)}, shape={tuple(voice.waveform.shape)}"
+                )
+
+                w = voice.waveform
+                if w.dim() == 2:
+                    w = w.repeat(2, 1) if w.shape[0] == 1 else w
+                    w = w.unsqueeze(0)
+                elif w.dim() == 3 and w.shape[1] == 1:
+                    w = w.repeat(1, 2, 1)
+                n_ref = int(ref_duration * voice.sampling_rate)
+                if w.shape[-1] < n_ref:
+                    w = w.repeat(1, 1, (n_ref // w.shape[-1]) + 1)
+                w = w[..., :n_ref]
+                peak = w.abs().max()
+                if peak > 0:
+                    w = w * (10 ** (-4.0 / 20) / peak)
+
+                voice = Audio(waveform=w, sampling_rate=voice.sampling_rate)
+                pre_tokens = int(state.latent.shape[1])
+                ref_latent = audio_cond(lambda enc: vae_encode_audio(voice, enc, None))
+                logger.info(
+                    "[DramaBox] reference latent encoded: shape=%s, dtype=%s, device=%s",
+                    tuple(ref_latent.shape),
+                    ref_latent.dtype,
+                    ref_latent.device,
+                )
+                print(f"[DramaBox] reference latent shape: {tuple(ref_latent.shape)}")
+                cond = AudioConditionByReferenceLatent(
+                    latent=ref_latent.to(device, torch_dtype), strength=1.0
+                )
+                state = cond.apply_to(state, audio_tools)
+                post_tokens = int(state.latent.shape[1])
+                logger.info(
+                    "[DramaBox] conditioning applied: latent tokens %d -> %d",
+                    pre_tokens,
+                    post_tokens,
+                )
+                print(
+                    f"[DramaBox] conditioning applied: latent tokens {pre_tokens} -> {post_tokens}"
+                )
+                logger.info("[DramaBox] Voice reference encoded (wrapper-style decode path).")
             except Exception as exc:
                 logger.warning("[DramaBox] voice_ref failed (%s) — running without it", exc)
+                print(f"[DramaBox] Warning: voice_ref conditioning failed, continuing without it: {exc}")
 
         # ── 4. Add noise ────────────────────────────────────────────────
         gen = torch.Generator(device=device).manual_seed(seed)
         state = GaussianNoiser(generator=gen)(state, noise_scale=1.0)
 
         # ── 5. Encode text prompts ───────────────────────────────────────
-        # _clip_enc is always a comfy.sd.CLIP — either user-supplied or auto-loaded.
-        # Load the text encoder to GPU just for encoding, then let ComfyUI evict it.
+        # Bypass ComfyUI's CLIP.encode_from_tokens() wrapper and run the
+        # DramaBox text encoding pipeline directly — identical to what
+        # PromptEncoder._encode() does in the wrapper mode:
+        #   1. Gemma forward → raw hidden states [B, L, T, D]
+        #   2. trim padding to nearest num_learnable_registers multiple
+        #   3. movedim(1,-1) → [B, T, D, L]
+        #   4. EmbeddingsProcessor.process_hidden_states → audio_encoding
+        #
+        # The underlying LlamaModel.forward is patched at DramaBoxTEModel init
+        # (_fix_rope_position_ids in dramabox_clip.py) to compute position_ids
+        # via cumsum(attention_mask)-1, matching HuggingFace Gemma3 exactly.
         logger.info("[DramaBox] Encoding prompts…")
         mm.load_models_gpu([_clip_enc.patcher])
-        tokens_pos = _clip_enc.tokenize(used_prompt)
-        cond_pos   = _clip_enc.encode_from_tokens(tokens_pos, return_dict=True)
-        a_ctx      = cond_pos["cond"].to(device=device, dtype=torch_dtype)
-        del cond_pos, tokens_pos
-        a_ctx_neg  = None
-        if cfg_scale > 1.0:
-            tokens_neg = _clip_enc.tokenize(negative_prompt)
-            cond_neg   = _clip_enc.encode_from_tokens(tokens_neg, return_dict=True)
-            a_ctx_neg  = cond_neg["cond"].to(device=device, dtype=torch_dtype)
-            del cond_neg, tokens_neg
+        te_model = _clip_enc.cond_stage_model          # DramaBoxTEModel
+        te_model.set_clip_options({"execution_device": _clip_enc.patcher.load_device})
 
-        # Keep context embeddings untouched (no trim/pad).
-        # Let GuidedDenoiser auto-batch when contexts are compatible and
-        # fall back to separate passes only when needed.
-        if a_ctx_neg is not None and a_ctx.dim() == 3 and a_ctx_neg.dim() == 3:
-            if a_ctx.shape[1] != a_ctx_neg.shape[1]:
-                pos_len = a_ctx.shape[1]
-                neg_len = a_ctx_neg.shape[1]
-                logger.info(
-                    "[DramaBox] CFG context alignment (no_align): keeping pos=%d neg=%d unchanged",
-                    pos_len,
-                    neg_len,
-                )
+        def _encode_one(prompt: str) -> torch.Tensor:
+            tokens = _clip_enc.tokenize(prompt)
+            audio_enc, _, _ = te_model.encode_token_weights(tokens)
+            return audio_enc.to(device=device, dtype=torch_dtype)
+
+        a_ctx     = _encode_one(used_prompt)
+        a_ctx_neg = None
+        if cfg_scale > 1.0:
+            a_ctx_neg = _encode_one(negative_prompt)
+        te_model.reset_clip_options()
 
         # Unified offload policy from Options (or preference-based default).
         if offload_policy in {"offload_to_cpu", "offload"}:
@@ -1795,21 +1911,35 @@ class DramaBoxTTS:
         )
         sigmas = LTX2Scheduler().execute(steps=steps, latent=state.latent).to(device)
         x0 = X0Model(transformer)
-        _, audio_state = euler_denoising_loop(
-            sigmas=sigmas,
-            video_state=None,
-            audio_state=state,
-            stepper=EulerDiffusionStep(),
-            transformer=x0,
-            denoiser=denoiser,
-        )
+        audio_state = None
+        try:
+            _, audio_state = euler_denoising_loop(
+                sigmas=sigmas,
+                video_state=None,
+                audio_state=state,
+                stepper=EulerDiffusionStep(),
+                transformer=x0,
+                denoiser=denoiser,
+            )
+        except RuntimeError as exc:
+            if _is_cuda_cpu_device_mismatch(exc):
+                clean_msg = _build_device_mismatch_message(generation_mode, offload_policy)
+                logger.error("%s Original error: %s", clean_msg, exc)
+                raise RuntimeError(clean_msg) from exc
+            if _is_cuda_oom(exc):
+                clean_msg = _build_cuda_oom_message(generation_mode, offload_policy)
+                logger.error("%s Original error: %s", clean_msg, exc)
+                raise RuntimeError(clean_msg) from exc
+            raise
+        finally:
+            # Always restore cached transformer if LoRA deltas were applied.
+            if _applied_deltas:
+                _remove_lora_deltas(transformer, _applied_deltas)
+                _applied_deltas.clear()
+            mm.soft_empty_cache()
 
-        mm.soft_empty_cache()
-
-        # Restore the cached transformer by undoing any LoRA deltas applied above.
-        if _applied_deltas:
-            _remove_lora_deltas(transformer, _applied_deltas)
-            _applied_deltas.clear()
+        if audio_state is None:
+            raise RuntimeError("[DramaBox] Denoising finished without audio output state.")
 
         # ── 8. Unpatchify + end-of-clip silence-prior fix ─────────────────
         audio_state = audio_tools.clear_conditioning(audio_state)

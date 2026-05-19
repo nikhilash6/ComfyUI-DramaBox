@@ -270,6 +270,49 @@ def _expand_cli_values(values, target_len: int, default):
     return out[:target_len]
 
 
+def _is_cuda_cpu_device_mismatch(exc: RuntimeError) -> bool:
+    """Return True for common torch CUDA/CPU mixed-tensor runtime errors."""
+    msg = str(exc).lower()
+    return (
+        "expected all tensors to be on the same device" in msg
+        and "cuda" in msg
+        and "cpu" in msg
+    )
+
+
+def _is_cuda_oom(exc: RuntimeError) -> bool:
+    """Return True for common CUDA out-of-memory runtime errors."""
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    msg = str(exc).lower()
+    if "cuda error: out of memory" in msg:
+        return True
+    return "out of memory" in msg and any(tok in msg for tok in ("cuda", "cudnn", "cublas"))
+
+
+def _build_device_mismatch_message() -> str:
+    return (
+        "[DramaBox] Denoising failed due to mixed CUDA/CPU tensors.\n"
+        "Likely cause: VRAM pressure caused a partial transformer load in the one-shot backend.\n"
+        "Recommended actions:\n"
+        "1. Close other heavy models/workflows and retry.\n"
+        "2. Reduce memory pressure (smaller jobs, fewer concurrent models).\n"
+        "3. If running from ComfyUI, run the DramaBox Unload node once and retry.\n"
+        "4. If this persists, use dramabox_wrapper with offload_to_cpu."
+    )
+
+
+def _build_cuda_oom_message() -> str:
+    return (
+        "[DramaBox] Denoising failed due to CUDA out-of-memory (OOM).\n"
+        "Recommended actions:\n"
+        "1. Close other heavy models/workflows and retry.\n"
+        "2. Reduce memory pressure (smaller jobs, fewer concurrent models).\n"
+        "3. If running from ComfyUI, run the DramaBox Unload node once and retry.\n"
+        "4. If this persists, use dramabox_wrapper with offload_to_cpu."
+    )
+
+
 def _apply_lora_deltas(transformer: torch.nn.Module, lora_path: str, strength: float) -> list:
     """Apply LoRA deltas directly to transformer weights.
 
@@ -391,8 +434,7 @@ def parse_args():
         action="append",
         default=[],
         help=(
-            "Optional rank hint for each --lora (kept for compatibility). "
-            "Can be provided multiple times; if omitted defaults to 128."
+            "Optional rank hint for each --lora (kept for compatibility)."
         ),
     )
     p.add_argument(
@@ -762,14 +804,25 @@ def main():
     logging.info(f"Running denoising loop ({len(sigmas) - 1} steps)...")
     with gpu_model(x0_model) as model:
         denoise_fn = heun_denoising_loop if args.sampler == "heun" else euler_denoising_loop
-        _, audio_state = denoise_fn(
-            sigmas=sigmas,
-            video_state=None,
-            audio_state=noised_state,
-            stepper=stepper,
-            transformer=model,
-            denoiser=denoiser,
-        )
+        try:
+            _, audio_state = denoise_fn(
+                sigmas=sigmas,
+                video_state=None,
+                audio_state=noised_state,
+                stepper=stepper,
+                transformer=model,
+                denoiser=denoiser,
+            )
+        except RuntimeError as exc:
+            if _is_cuda_cpu_device_mismatch(exc):
+                clean_msg = _build_device_mismatch_message()
+                logging.error("%s Original error: %s", clean_msg, exc)
+                raise RuntimeError(clean_msg) from exc
+            if _is_cuda_oom(exc):
+                clean_msg = _build_cuda_oom_message()
+                logging.error("%s Original error: %s", clean_msg, exc)
+                raise RuntimeError(clean_msg) from exc
+            raise
 
     del velocity_model, x0_model
     torch.cuda.empty_cache()
