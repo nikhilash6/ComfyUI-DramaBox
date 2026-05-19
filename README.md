@@ -2,7 +2,7 @@
 
 ComfyUI custom nodes for [DramaBox](https://github.com/resemble-ai/DramaBox) — ResembleAI's expressive text-to-speech system built on the LTX-2.3 audio diffusion transformer.
 
-**Please Note:** The `dramabox_wrapper` is the recommended generation method for the most native DramaBox-like behavior, but it is disabled by default because it can require significantly more memory.  You can enable it in Preference.  Likewise, you can turn off model unload for much faster re-generations. Use the `DramaBox Unload` node to unload DramaBox if needed in your workflows.
+**Please Note:** The `dramabox_wrapper` is the recommended generation method for the most native DramaBox-like behavior, but will bypass ComfyUI's Memory Management.  You can switch to using a more traditional text encoding method if you have issues in Preference. But the Quality will suffer. Likewise, you can turn off model unload for much faster re-generations. Use the `DramaBox Unload` node to unload DramaBox if needed in your workflows.  I'm hoping to improved the Text encoding method so it could become the default and integrate better with Comfy, eventually.
 
 ## Nodes
 
