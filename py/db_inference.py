@@ -485,8 +485,8 @@ def main():
     if args.stg_scale is None:
         args.stg_scale = 0.0 if is_distilled else 1.0
     if args.rescale_scale is None:
-        # Auto cfg-aware rescale: imported from inference_server to keep one source of truth.
-        from inference_server import auto_rescale_for_cfg
+        # Auto cfg-aware rescale: imported from db_inference_server to keep one source of truth.
+        from db_inference_server import auto_rescale_for_cfg
         args.rescale_scale = 0.0 if is_distilled else auto_rescale_for_cfg(args.cfg_scale)
     if args.modality_scale is None:
         args.modality_scale = 1.0 if is_distilled else 3.0

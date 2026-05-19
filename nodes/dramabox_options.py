@@ -5,7 +5,7 @@ Mirrors the pattern of PromptGenOptions: all inputs are optional, the node
 returns a plain dict that DramaBox TTS reads when connected.
 
 rescale_scale uses the special sentinel value -1.0 to mean "auto" (the CFG-
-aware schedule in inference_server.py). Set it to any value in [0, 1] to
+aware schedule in db_inference_server.py). Set it to any value in [0, 1] to
 override, or leave at -1 for the recommended automatic behaviour.
 """
 

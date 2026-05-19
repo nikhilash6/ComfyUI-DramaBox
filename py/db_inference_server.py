@@ -2,10 +2,10 @@
 """
 Warm TTS server — loads models once, accepts requests via stdin or function call.
 
-The key insight: inference.py spends 11s on Gemma + 8s on model load every call.
+The key insight: db_inference.py spends 11s on Gemma + 8s on model load every call.
 This server loads everything once and keeps it warm.
 
-We import and call the same code paths as inference.py but cache the heavy objects.
+We import and call the same code paths as db_inference.py but cache the heavy objects.
 """
 import json
 import logging
@@ -61,7 +61,7 @@ _AUTO_DURATION_SAFETY_PAD_SEC = 0.8
 def estimate_duration(prompt, multiplier=1.1, speed=1.0):
     """Defer to the richer CLI estimator (sentence-aware + non-verbal action
     budget) so warm-server outputs match the lengths of the per-call CLI runs."""
-    from inference import estimate_speech_duration
+    from db_inference import estimate_speech_duration
     base = estimate_speech_duration(prompt, speed)
     return max(3.0, round(base * multiplier + _AUTO_DURATION_SAFETY_PAD_SEC, 1))
 

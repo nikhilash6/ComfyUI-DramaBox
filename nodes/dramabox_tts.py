@@ -759,7 +759,7 @@ def _apply_lora_deltas(transformer: torch.nn.Module, lora_path: str, strength: f
     """Apply LoRA weights to transformer in-place using manual delta math.
 
     Handles both PEFT format (base_model.model.*) and original ID-LoRA format
-    (diffusion_model.*), matching the approach in py/inference.py.
+    (diffusion_model.*), matching the approach in py/db_inference.py.
 
     Returns a list of (param_name, delta_tensor) so the caller can undo the
     changes after inference by subtracting each delta.
@@ -1129,7 +1129,7 @@ def _get_og_server(device):
 
     _apply_dramabox_wrapper_compat()
 
-    from inference_server import TTSServer
+    from db_inference_server import TTSServer
     from model_downloader import get_gemma_path, get_model_path
 
     models_dir = _get_models_dir()
@@ -1280,7 +1280,7 @@ def _run_og_low_memory_once(
     ckpt_audio = get_model_path("audio_components", cache_dir=models_dir)
     gemma_root = get_gemma_path(cache_dir=models_dir)
 
-    infer_script = os.path.join(_SRC_DIR, "inference.py")
+    infer_script = os.path.join(_SRC_DIR, "db_inference.py")
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_out:
         output_path = tmp_out.name
@@ -1627,7 +1627,7 @@ class DramaBoxTTS:
         from ltx_core.types import Audio, AudioLatentShape, VideoPixelShape
         from dramabox_ltx_compat import GuidedDenoiser, euler_denoising_loop
         from audio_conditioning import AudioConditionByReferenceLatent
-        from inference import estimate_speech_duration
+        from db_inference import estimate_speech_duration
 
         t_total = time.time()
         patchifier = AudioPatchifier(patch_size=1)
@@ -1765,7 +1765,7 @@ class DramaBoxTTS:
         )
 
         # ── 7. Diffusion sampling ────────────────────────────────────────
-        # Apply LoRAs via manual delta math (matching py/inference.py's PEFT
+        # Apply LoRAs via manual delta math (matching py/db_inference.py's PEFT
         # approach). Deltas are added before moving the model to GPU and
         # subtracted after inference so the cached transformer stays unmodified.
         xfmr_patchers = model["xfmr_patchers"]
