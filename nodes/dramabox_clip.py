@@ -18,8 +18,7 @@ DramaBoxTEModel.encode_token_weights() therefore:
   1. Calls gemma3_12b.encode_token_weights() → [B, L, T, D]
   2. movedim(1, -1)                          → [B, T, D, L]
   3. embeddings_processor.process_hidden_states() → EmbeddingsProcessorOutput
-  4. Returns audio_encoding as the primary cond, with extra dict carrying
-     the full output for the TTS node.
+    4. Returns audio_encoding as the primary cond.
 """
 
 import glob

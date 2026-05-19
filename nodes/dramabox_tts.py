@@ -1828,17 +1828,8 @@ class DramaBoxTTS:
         state = GaussianNoiser(generator=gen)(state, noise_scale=1.0)
 
         # ── 5. Encode text prompts ───────────────────────────────────────
-        # Bypass ComfyUI's CLIP.encode_from_tokens() wrapper and run the
-        # DramaBox text encoding pipeline directly — identical to what
-        # PromptEncoder._encode() does in the wrapper mode:
-        #   1. Gemma forward → raw hidden states [B, L, T, D]
-        #   2. trim padding to nearest num_learnable_registers multiple
-        #   3. movedim(1,-1) → [B, T, D, L]
-        #   4. EmbeddingsProcessor.process_hidden_states → audio_encoding
-        #
-        # The underlying LlamaModel.forward is patched at DramaBoxTEModel init
-        # (_fix_rope_position_ids in dramabox_clip.py) to compute position_ids
-        # via cumsum(attention_mask)-1, matching HuggingFace Gemma3 exactly.
+        # Use DramaBoxTEModel.encode_token_weights() for both backends so the
+        # Comfy node path follows one shared, DramaBox-compatible routine.
         logger.info("[DramaBox] Encoding prompts…")
         mm.load_models_gpu([_clip_enc.patcher])
         te_model = _clip_enc.cond_stage_model          # DramaBoxTEModel
